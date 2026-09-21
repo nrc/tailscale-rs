@@ -97,27 +97,7 @@ impl<TableStorage: schema::GeneratedStorage> Storage<TableStorage> {
     where
         D::Value: Clone + PartialEq,
     {
-        let singleton = D::get_mut(&mut self.tables);
-
-        // Check for a value before cloning: a removed singleton is stored as a `None` in an occupied
-        // slot, and cloning that into the free slot would look like a mutation and cause a spurious
-        // `Remove` notification.
-        singleton.get(txn_id)?.as_ref()?;
-
-        // If this transaction has already written to the singleton, then it counts as mutated however
-        // `f` behaves, and the clone we'd roll back isn't ours to roll back.
-        let previously_written = singleton.modified_in_txn(txn_id).is_some();
-
-        let value = singleton.internal_clone(txn_id)?.as_mut()?;
-        let old_value = (!previously_written).then(|| value.clone());
-        let result = f(value);
-
-        if old_value.is_some_and(|old_value| *value == old_value) {
-            // `f` left the value alone, so discard the clone.
-            singleton.gc_txn(txn_id);
-        }
-
-        Some(result)
+        with_mut_singleton(D::get_mut(&mut self.tables), txn_id, f)
     }
 
     pub(crate) fn get_singleton_notification_value<
@@ -182,6 +162,35 @@ impl<TableStorage: schema::GeneratedStorage> Storage<TableStorage> {
             self.pending_txn = None;
         }
     }
+}
+
+/// Pass a mutable reference to the value of `singleton` visible to `txn_id` to `f`.
+///
+/// Returns `None` (and does not call `f`) if there is no value for the singleton.
+pub(crate) fn with_mut_singleton<V: Clone + PartialEq, T>(
+    singleton: &mut VersionedValue<Option<V>>,
+    txn_id: TxnId,
+    f: impl FnOnce(&mut V) -> T,
+) -> Option<T> {
+    // Check for a value before cloning: a removed singleton is stored as a `None` in an occupied
+    // slot, and cloning that into the free slot would look like a mutation and cause a spurious
+    // `Remove` notification.
+    singleton.get(txn_id)?.as_ref()?;
+
+    // If this transaction has already written to the singleton, then it counts as mutated however
+    // `f` behaves, and the clone we'd roll back isn't ours to roll back.
+    let previously_written = singleton.modified_in_txn(txn_id).is_some();
+
+    let value = singleton.internal_clone(txn_id)?.as_mut()?;
+    let old_value = (!previously_written).then(|| value.clone());
+    let result = f(value);
+
+    if old_value.is_some_and(|old_value| *value == old_value) {
+        // `f` left the value alone, so discard the clone.
+        singleton.gc_txn(txn_id);
+    }
+
+    Some(result)
 }
 
 /// An MVCC value with only two versions (versioned by [`TxnId`]).

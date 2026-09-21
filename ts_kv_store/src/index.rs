@@ -1,15 +1,10 @@
-use std::{
-    borrow::Borrow,
-    hash::Hash,
-    marker::PhantomData,
-    sync::{RwLockReadGuard, RwLockWriteGuard},
-};
+use std::{borrow::Borrow, hash::Hash, marker::PhantomData};
 
 use crate::{
-    KvStore, Owner, Result, RoTransaction, Transaction,
-    operations::{Base, BaseKey, BaseValue, IndexValue, IndexedOps, IndexedOpsMut, Ops, OpsMut},
+    KvStore, Owner, Result, RoTableTransaction, TableTransaction,
+    iter::{Keys, KeysAndValues},
+    operations::{BaseKey, BaseValue, IndexMut, IndexRef, IndexValue, TableRef},
     schema::{IndexDesc, TableDesc},
-    storage::Storage,
     transactions::SchemaTransaction,
 };
 
@@ -17,23 +12,20 @@ use crate::{
 ///
 /// Returns the error from committing, if there is one. This is how the non-transactional index
 /// operations get their atomicity: each one is a single-operation transaction.
-fn in_index_txn<'store, D, T: 'store>(
-    store: &'store KvStore<D::Storage>,
+fn in_index_txn<D, T>(
+    store: &KvStore<D::Storage>,
     owner: Owner,
-    f: impl FnOnce(&mut IndexTransaction<'_, 'store, D>) -> T,
+    f: impl FnOnce(&mut IndexTransaction<'_, '_, D>) -> T,
 ) -> Result<T>
 where
     D: IndexDesc,
 {
     let mut txn = store.begin_transaction(owner);
-    let result = {
-        // An index has no field of its own in the generated transaction, so we reach the underlying
-        // transaction via the base table's view of it.
-        let store_txn = <D::BaseTable as TableDesc>::make_txn_view(&mut txn).store_txn();
-        // SAFETY: `store_txn` outlives `txn` by the signature of `make_txn_view`, which outlives `'store` by the signature of
-        // `KvStore::begin_transaction`. The `'store` bound on `T` ensures the result of `f` cannot outlive `store`.
-        f(&mut unsafe { IndexTransaction::new(store_txn) })
-    };
+    // An index has no field of its own in the generated transaction, so we reach the table via the
+    // base table's view.
+    let result = f(&mut IndexTransaction::new(
+        <D::BaseTable as TableDesc>::make_txn_view(&mut txn),
+    ));
     txn.commit()?;
     Ok(result)
 }
@@ -304,68 +296,35 @@ impl<'store, D: IndexDesc> IndexWithOwner<'store, D> {
 ///
 /// `D` describes the index table, its base table is `D::BaseTable`.
 ///
-/// There is a field of this type for each of a table's indexes in the struct returned by
-/// [`TableTransaction::indexes`](crate::TableTransaction::indexes).
+/// Created by the methods of the struct returned by
+/// [`TableTransaction::indexes`](crate::TableTransaction::indexes). An `IndexTransaction` mutably
+/// borrows the base table's view for `'txn`, so only one index of a table can be used at a time.
 pub struct IndexTransaction<'guard, 'txn, D: IndexDesc> {
-    /// Invariant: `txn` outlives `self` and `'txn`.
-    txn: *mut Transaction<'guard, D::Storage>,
-    desc: PhantomData<&'txn mut D>,
+    base: &'txn mut TableTransaction<'guard, D::Storage, D::BaseTable>,
+    desc: PhantomData<D>,
 }
 
 impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
-    /// SAFETY: the caller must ensure that the target of `txn` will outlive `self` and `'txn`.
+    /// Create a view of the index `D` of the table viewed by `base`.
     #[doc(hidden)]
-    pub unsafe fn new(txn: *mut Transaction<'guard, D::Storage>) -> Self {
+    pub fn new(base: &'txn mut TableTransaction<'guard, D::Storage, D::BaseTable>) -> Self {
         IndexTransaction {
-            txn,
+            base,
             desc: PhantomData,
         }
     }
 
-    fn owner(&self) -> Owner {
-        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant), and
-        // `owner` has `'static` lifetime.
-        unsafe { (*self.txn).owner }
+    fn index_ref(&self) -> IndexRef<'_, D> {
+        IndexRef::new(self.base.table_ref())
     }
-}
 
-impl<'guard, 'txn, 'a, D: IndexDesc> Ops<D::Storage> for &'a IndexTransaction<'guard, 'txn, D> {
-    type ReadLock = &'a RwLockWriteGuard<'guard, Storage<D::Storage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant),
-        // and the returned lock is a reference lifetime with lifetime `'a`.
-        unsafe { (*self.txn).guard.as_ref().unwrap() }
+    fn index_mut(&mut self) -> IndexMut<'_, D> {
+        IndexMut::new(self.base.table_mut())
     }
-}
 
-impl<'guard, 'txn, 'a, D: IndexDesc> OpsMut<D::Storage>
-    for &'a mut IndexTransaction<'guard, 'txn, D>
-{
-    type WriteLock = &'a mut RwLockWriteGuard<'guard, Storage<D::Storage>>;
-
-    fn write_lock(self) -> Self::WriteLock {
-        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant),
-        // and the returned lock is a reference lifetime with lifetime `'a`.
-        unsafe { (*self.txn).guard.as_mut().unwrap() }
-    }
-}
-
-impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage> for &IndexTransaction<'guard, 'txn, D> {
-    type IndexDesc = D;
-}
-
-// SAFETY: by the safety invariant of `IndexDesc`.
-unsafe impl<'guard, 'txn, D: IndexDesc> IndexedOpsMut<D::Storage>
-    for &mut IndexTransaction<'guard, 'txn, D>
-{
-    type IndexDesc = D;
-}
-
-impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
     /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
-        <&Self as IndexedOps<_>>::check_consistent(self)
+        self.index_ref().check_consistent()
     }
 
     /// Get a row of the table from the store by cloning the value.
@@ -379,7 +338,9 @@ impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::get::<Q>(self, key, self.owner())
+        self.index_ref()
+            .get(key)
+            .map(|(k, v)| (k.clone(), v.clone()))
     }
 
     /// Get immutable access to a row of the table in the store by reference.
@@ -391,7 +352,7 @@ impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.owner())
+        self.index_ref().get(key).map(|(k, v)| f(k, v))
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -409,7 +370,8 @@ impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
         BaseValue<D>: Clone + PartialEq,
         IndexValue<D>: Eq + Hash,
     {
-        <&mut Self as IndexedOpsMut<_>>::with_mut::<Q, T>(self, key, f, self.owner())
+        let owner = self.base.txn_owner();
+        self.index_mut().with_mut(key, f, owner)
     }
 
     /// Remove a row from the table.
@@ -419,36 +381,37 @@ impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
         IndexValue<D>: Eq + Hash + ToOwned<Owned = BaseKey<D>>,
     {
-        <&mut Self as IndexedOpsMut<_>>::remove::<Q>(self, key, self.owner())
+        let owner = self.base.txn_owner();
+        self.index_mut().remove(key, owner)
     }
 
     /// Iterate all the keys in the index and value in the base table.
     pub fn iter(&self) -> impl Iterator<Item = (&D::Key, &BaseKey<D>, &BaseValue<D>)>
     where
-        D: 'guard,
-        Base<D>: 'guard,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::iter(self, self.owner())
+        self.index_ref().iter::<KeysAndValues>()
     }
 
     /// Iterate all the keys in the index.
-    pub fn keys(&self) -> impl Iterator<Item = &D::Key>
-    where
-        D: 'guard,
-        Base<D>: 'guard,
-    {
-        <&Self as IndexedOps<_>>::keys(self, self.owner())
+    pub fn keys(&self) -> impl Iterator<Item = &D::Key> {
+        self.index_ref().iter::<Keys>()
     }
 
-    /// Iterate all the key/value pairs in a table.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&D::Key, &BaseKey<D>, &mut BaseValue<D>)>
+    /// Iterate all the key/value pairs in a table, with mutable access to the values.
+    ///
+    /// Access is scoped by a closure rather than by returning an iterator, because the table's
+    /// indexes are updated from the mutated values once `f` returns.
+    pub fn with_iter_mut<F, T>(&mut self, f: F) -> T
     where
+        F: for<'a> FnOnce(
+            &mut dyn Iterator<Item = (&'a D::Key, &'a BaseKey<D>, &'a mut BaseValue<D>)>,
+        ) -> T,
         IndexValue<D>: Eq + Hash + Clone,
         BaseValue<D>: Clone + PartialEq,
     {
-        let owner = self.owner();
-        IndexedOpsMut::iter_mut(self, owner)
+        let owner = self.base.txn_owner();
+        self.index_mut().with_iter_mut(owner, f)
     }
 }
 
@@ -462,46 +425,27 @@ impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
 /// There is a field of this type for each of a table's indexes in the struct returned by
 /// [`RoTableTransaction::indexes`](crate::RoTableTransaction::indexes).
 pub struct RoIndexTransaction<'guard, 'txn, D: IndexDesc> {
-    /// Invariant: `txn` outlives `self` and `'txn`.
-    txn: *const RoTransaction<'guard, D::Storage>,
-    desc: PhantomData<&'txn D>,
+    base: &'txn RoTableTransaction<'guard, D::Storage, D::BaseTable>,
+    desc: PhantomData<D>,
 }
 
 impl<'guard, 'txn, D: IndexDesc> RoIndexTransaction<'guard, 'txn, D> {
-    /// SAFETY: the caller must ensure that the target of `txn` will outlive `self` and `'txn`.
+    /// Create a view of the index `D` of the table viewed by `base`.
     #[doc(hidden)]
-    pub unsafe fn new(txn: *const RoTransaction<'guard, D::Storage>) -> Self {
+    pub fn new(base: &'txn RoTableTransaction<'guard, D::Storage, D::BaseTable>) -> Self {
         RoIndexTransaction {
-            txn,
+            base,
             desc: PhantomData,
         }
     }
 
-    fn owner(&self) -> Owner {
-        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant), and
-        // `owner` has `'static` lifetime.
-        unsafe { (*self.txn).owner }
+    fn index_ref(&self) -> IndexRef<'txn, D> {
+        IndexRef::new(self.base.table_ref())
     }
-}
 
-impl<'guard, 'txn, 'a, D: IndexDesc> Ops<D::Storage> for &'a RoIndexTransaction<'guard, 'txn, D> {
-    type ReadLock = &'a RwLockReadGuard<'guard, Storage<D::Storage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant),
-        // and the returned lock is a reference lifetime with lifetime `'a`.
-        unsafe { &(*self.txn).guard }
-    }
-}
-
-impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage> for &RoIndexTransaction<'guard, 'txn, D> {
-    type IndexDesc = D;
-}
-
-impl<'guard, 'txn, D: IndexDesc> RoIndexTransaction<'guard, 'txn, D> {
     /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
-        <&Self as IndexedOps<_>>::check_consistent(self)
+        self.index_ref().check_consistent()
     }
 
     /// Get a row of the table from the store by cloning the value.
@@ -515,7 +459,9 @@ impl<'guard, 'txn, D: IndexDesc> RoIndexTransaction<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::get::<Q>(self, key, self.owner())
+        self.index_ref()
+            .get(key)
+            .map(|(k, v)| (k.clone(), v.clone()))
     }
 
     /// Get immutable access to a row of the table in the store by reference.
@@ -527,24 +473,20 @@ impl<'guard, 'txn, D: IndexDesc> RoIndexTransaction<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.owner())
+        self.index_ref().get(key).map(|(k, v)| f(k, v))
     }
 
     /// Iterate all the keys in the index and value in the base table.
     pub fn iter(&self) -> impl Iterator<Item = (&D::Key, &BaseKey<D>, &BaseValue<D>)>
     where
-        D: 'guard,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::iter(self, self.owner())
+        self.index_ref().iter::<KeysAndValues>()
     }
 
     /// Iterate all the keys in the index.
-    pub fn keys(&self) -> impl Iterator<Item = &D::Key>
-    where
-        D: 'guard,
-    {
-        <&Self as IndexedOps<_>>::keys(self, self.owner())
+    pub fn keys(&self) -> impl Iterator<Item = &D::Key> {
+        self.index_ref().iter::<Keys>()
     }
 }
 

@@ -130,13 +130,19 @@ pub trait Indexable: TableDesc {
 
     /// The transactional counterpart of [`Self::Indexes`], see
     /// [`crate::TableTransaction::indexes`].
-    type TransactionIndexes<'guard, 'txn>: From<*mut crate::Transaction<'guard, Self::Storage>>;
+    type TransactionIndexes<'guard, 'txn>: From<
+        &'txn mut TableTransaction<'guard, Self::Storage, Self>,
+    >
+    where
+        'guard: 'txn;
 
     /// The read-only transactional counterpart of [`Self::Indexes`], see
     /// [`crate::RoTableTransaction::indexes`].
     type RoTransactionIndexes<'guard, 'txn>: From<
-        *const crate::RoTransaction<'guard, Self::Storage>,
-    >;
+        &'txn crate::RoTableTransaction<'guard, Self::Storage, Self>,
+    >
+    where
+        'guard: 'txn;
 }
 
 /// Describes a table used as an index.
@@ -449,8 +455,8 @@ macro_rules! store {
             impl $crate::schema::Indexable for $name {
                 type Indexes<'store> = index::$name::Indexes<'store>;
                 type IndexesWithOwner<'store> = index::$name::IndexesWithOwner<'store>;
-                type TransactionIndexes<'guard, 'txn> = index::$name::TransactionIndexes<'guard, 'txn>;
-                type RoTransactionIndexes<'guard, 'txn> = index::$name::RoTransactionIndexes<'guard, 'txn>;
+                type TransactionIndexes<'guard, 'txn> = index::$name::TransactionIndexes<'txn, $crate::TableTransaction<'guard, TableStorage, $name>> where 'guard: 'txn;
+                type RoTransactionIndexes<'guard, 'txn> = index::$name::RoTransactionIndexes<'guard, 'txn> where 'guard: 'txn;
             }
 
             $(
@@ -618,16 +624,20 @@ macro_rules! store {
                         )*
                     }
 
-                    /// Access to the table's indexes within a transaction, with a field for each index.
+                    /// Access to the table's indexes within a transaction, with a method for each
+                    /// index.
                     ///
-                    /// Returned by `TableTransaction::indexes`.
-                    pub struct TransactionIndexes<'guard, 'txn> {
+                    /// Returned by `TableTransaction::indexes`. Unlike the non-transactional and
+                    /// read-only counterparts, the indexes are accessed by methods rather than
+                    /// fields: each index gives mutable access to the table, so only one may be used
+                    /// at a time.
+                    ///
+                    /// `Base` is the transactional view of the table.
+                    pub struct TransactionIndexes<'txn, Base> {
+                        // Unused if the table has no indexes.
                         #[doc(hidden)]
-                        pub(in super::super) _txn: core::marker::PhantomData<(&'txn mut (), &'guard ())>,
-                        $(
-                            #[allow(dead_code)]
-                            pub $field: $crate::IndexTransaction<'guard, 'txn, $field>,
-                        )*
+                        #[allow(dead_code)]
+                        pub(in super::super) base: &'txn mut Base,
                     }
 
                     /// Access to the table's indexes within a read-only transaction, with a field
@@ -665,20 +675,27 @@ macro_rules! store {
                 }
             }
 
-            impl<'guard, 'txn> From<*mut $crate::Transaction<'guard, TableStorage>> for index::$name::TransactionIndexes<'guard, 'txn> {
-                fn from(_txn: *mut $crate::Transaction<'guard, TableStorage>) -> Self {
-                    index::$name::TransactionIndexes {
-                        _txn: core::marker::PhantomData,
-                        $($field: unsafe { $crate::IndexTransaction::new(_txn) },)*
-                    }
+            impl<'guard, 'txn> From<&'txn mut $crate::TableTransaction<'guard, TableStorage, $name>> for index::$name::TransactionIndexes<'txn, $crate::TableTransaction<'guard, TableStorage, $name>> {
+                fn from(base: &'txn mut $crate::TableTransaction<'guard, TableStorage, $name>) -> Self {
+                    index::$name::TransactionIndexes { base }
                 }
             }
 
-            impl<'guard, 'txn> From<*const $crate::RoTransaction<'guard, TableStorage>> for index::$name::RoTransactionIndexes<'guard, 'txn> {
-                fn from(_txn: *const $crate::RoTransaction<'guard, TableStorage>) -> Self {
+            #[allow(dead_code)]
+            impl<'guard, 'txn> index::$name::TransactionIndexes<'txn, $crate::TableTransaction<'guard, TableStorage, $name>> {
+                $(
+                    /// Access the table via this index.
+                    pub fn $field(self) -> $crate::IndexTransaction<'guard, 'txn, index::$name::$field> {
+                        $crate::IndexTransaction::new(self.base)
+                    }
+                )*
+            }
+
+            impl<'guard, 'txn> From<&'txn $crate::RoTableTransaction<'guard, TableStorage, $name>> for index::$name::RoTransactionIndexes<'guard, 'txn> {
+                fn from(_base: &'txn $crate::RoTableTransaction<'guard, TableStorage, $name>) -> Self {
                     index::$name::RoTransactionIndexes {
                         _txn: core::marker::PhantomData,
-                        $($field: unsafe { $crate::RoIndexTransaction::new(_txn) },)*
+                        $($field: $crate::RoIndexTransaction::new(_base),)*
                     }
                 }
             }

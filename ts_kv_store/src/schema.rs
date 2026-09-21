@@ -857,9 +857,9 @@ macro_rules! store {
 
         #[allow(non_snake_case)]
         pub struct Transaction<'a> {
-            // `None` only once the transaction has been committed; dropping a `Some` rolls the
-            // transaction back and releases the store's lock.
-            store_txn: Option<Box<$crate::Transaction<'a, TableStorage>>>,
+            // Shared with every view (field) of the transaction. The transaction is rolled back
+            // and the store's lock released when the last of them is dropped.
+            store_txn: std::rc::Rc<$crate::Transaction<'a, TableStorage>>,
 
             $($(#[allow(dead_code)] pub $name: $crate::TableTransaction<'a, TableStorage, $name>,)*)?
             $($(#[allow(dead_code)] pub $sname: $crate::SingletonTransaction<'a, TableStorage, $sname>,)*)?
@@ -867,35 +867,44 @@ macro_rules! store {
 
         impl<'a> Transaction<'a> {
             fn new(store_txn: $crate::Transaction<'a, TableStorage>) -> Self {
-                let mut store_txn = Box::new(store_txn);
-                let raw = store_txn.as_mut() as *mut $crate::Transaction<'a, TableStorage>;
+                let store_txn = std::rc::Rc::new(store_txn);
 
+                // We create exactly one view of `store_txn` for each table and singleton. Each
+                // table (including its indexes) and singleton is stored in its own field of
+                // `TableStorage` (a duplicate name would be a compile error), and the `table_ptr`
+                // and `value_ptr` impls above return pointers to exactly those fields, so no two
+                // views access the same data.
                 Transaction {
-                    $($($name: unsafe { $crate::TableTransaction::new(raw) },)*)?
-                    $($($sname: unsafe { $crate::SingletonTransaction::new(raw) },)*)?
+                    $($(
+                        // SAFETY: this is the only view of `$name`, see above.
+                        $name: unsafe { $crate::TableTransaction::new(std::rc::Rc::clone(&store_txn)) },
+                    )*)?
+                    $($(
+                        // SAFETY: this is the only view of `$sname`, see above.
+                        $sname: unsafe { $crate::SingletonTransaction::new(std::rc::Rc::clone(&store_txn)) },
+                    )*)?
 
-                    store_txn: Some(store_txn),
+                    store_txn,
                 }
             }
 
-            pub fn commit(mut self) -> $crate::Result<()> {
-                // `Self` implements `Drop` (so that the per-table fields cannot be moved out of a
-                // transaction), which means `store_txn` cannot be moved out of `self` either; take
-                // it instead. Dropping `self` afterwards then has nothing left to roll back.
-                let store_txn = self.store_txn.take().expect("a transaction is committed once");
-                store_txn.commit()
+            /// Commit this transaction.
+            ///
+            /// Panics if one of this transaction's fields has been moved out of it and is still
+            /// alive (e.g., by swapping it with the field of another transaction).
+            pub fn commit(self) -> $crate::Result<()> {
+                let store_txn = std::rc::Rc::clone(&self.store_txn);
+                // Drop the views so that `store_txn` is the only reference to the transaction.
+                drop(self);
+                $crate::Transaction::commit_shared(store_txn)
             }
 
+            /// Explicitly rollback this transaction.
+            ///
+            /// A transaction can also be rolled-back by dropping it without first calling `commit`.
             pub fn rollback(self) {
                 // Dropping `self` causes the rollback.
             }
-        }
-
-        // Blocks moving the per-table/singleton fields out of the transaction: they hold pointers
-        // back into it, so they must not outlive it. Rolling back an uncommitted transaction is
-        // left to the drop glue for `store_txn`.
-        impl<'a> Drop for Transaction<'a> {
-            fn drop(&mut self) {}
         }
 
         impl<'a> $crate::transactions::SchemaTransaction for Transaction<'a> {
@@ -911,7 +920,9 @@ macro_rules! store {
 
         #[allow(non_snake_case)]
         pub struct RoTransaction<'a> {
-            _store_txn: Box<$crate::RoTransaction<'a, TableStorage>>,
+            // Shared with every view (field) of the transaction. The store's lock is released when
+            // the last of them is dropped.
+            _store_txn: std::rc::Rc<$crate::RoTransaction<'a, TableStorage>>,
 
             $($(#[allow(dead_code)] pub $name: $crate::RoTableTransaction<'a, TableStorage, $name>,)*)?
             $($(#[allow(dead_code)] pub $sname: $crate::RoSingletonTransaction<'a, TableStorage, $sname>,)*)?
@@ -919,30 +930,30 @@ macro_rules! store {
 
         impl<'a> RoTransaction<'a> {
             fn new(store_txn: $crate::RoTransaction<'a, TableStorage>) -> Self {
-                let _store_txn = Box::new(store_txn);
-                let raw = _store_txn.as_ref() as *const $crate::RoTransaction<'a, TableStorage>;
+                let _store_txn = std::rc::Rc::new(store_txn);
 
                 RoTransaction {
-                    $($($name: unsafe { $crate::RoTableTransaction::new(raw) },)*)?
-                    $($($sname: unsafe { $crate::RoSingletonTransaction::new(raw) },)*)?
+                    $($($name: $crate::RoTableTransaction::new(std::rc::Rc::clone(&_store_txn)),)*)?
+                    $($($sname: $crate::RoSingletonTransaction::new(std::rc::Rc::clone(&_store_txn)),)*)?
 
                     _store_txn,
                 }
             }
 
+            /// Commit this transaction.
+            ///
+            /// This simply drops the transaction (releasing its lock on the store) and always
+            /// succeeds.
             pub fn commit(self) -> $crate::Result<()> {
                 Ok(())
             }
 
+            /// Explicitly rollback this transaction.
+            ///
+            /// Like `commit`, this only drops this transaction's lock.
             pub fn rollback(self) {
                 // Dropping `self` causes the rollback.
             }
-        }
-
-        // Blocks moving the per-table/singleton fields out of the transaction: they hold pointers
-        // back into it, so they must not outlive it.
-        impl<'a> Drop for RoTransaction<'a> {
-            fn drop(&mut self) {}
         }
 
         impl<'a> $crate::transactions::SchemaTransaction for RoTransaction<'a> {

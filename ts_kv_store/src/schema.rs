@@ -1,10 +1,6 @@
 //! Traits and macros for defining the KvStore schema.
 
-use std::{
-    any::{Any, TypeId},
-    hash::Hash,
-    ops::Deref,
-};
+use std::{any::Any, hash::Hash, ops::Deref};
 
 use crate::{
     Owner, SingletonTransaction, TableTransaction,
@@ -36,6 +32,19 @@ pub trait SingletonDesc: Sized + 'static {
 
     /// Get a mutable reference to the field storing this singleton in `storage`.
     fn get_mut(storage: &mut Self::Storage) -> &mut VersionedValue<Option<Self::Value>>;
+
+    /// Get a pointer to the field storing this singleton in the storage pointed to by `storage`.
+    ///
+    /// Unlike `get_mut`, this does not create a reference to the whole storage, and so can be used
+    /// while there are live references to other parts of the storage.
+    ///
+    /// Implementations must return a pointer to a field of `*storage` which is distinct from the
+    /// fields used for every other singleton and table in the storage.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must be valid for reads and writes (it need not be uniquely borrowed).
+    unsafe fn value_ptr(storage: *mut Self::Storage) -> *mut VersionedValue<Option<Self::Value>>;
 
     /// Convert an optional reference to this singleton's value to it's notification value.
     fn notif_value(value: &Option<Self::Value>) -> &Option<Self::NotificationValue>;
@@ -72,8 +81,18 @@ pub trait TableDesc: Sized + 'static {
     /// Get a reference to the table in storage.
     fn get_table(storage: &Self::Storage) -> &Table<Self, Self::IndexStorage>;
 
-    /// Get a mutable reference to the table in storage.
-    fn get_table_mut(storage: &mut Self::Storage) -> &mut Table<Self, Self::IndexStorage>;
+    /// Get a pointer to the table in the storage pointed to by `storage`.
+    ///
+    /// This does not create a reference to the whole storage, and so can be used while there are
+    /// live references to other parts of the storage.
+    ///
+    /// Implementations must return a pointer to a field of `*storage` which is distinct from the
+    /// fields used for every other table and singleton in the storage.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must be valid for reads and writes (it need not be uniquely borrowed).
+    unsafe fn table_ptr(storage: *mut Self::Storage) -> *mut Table<Self, Self::IndexStorage>;
 
     /// Compare two references to this table's value type, returns `true` if the value type impls
     /// `PartialEq` and the values are equal. **Panics** if `Self::Value` does not impl `PartialEq`.
@@ -83,30 +102,6 @@ pub trait TableDesc: Sized + 'static {
     fn make_txn_view<'a, 'b>(
         txn: &'b mut <Self::Storage as GeneratedStorage>::Transaction<'a>,
     ) -> &'b mut TableTransaction<'a, Self::Storage, Self>;
-}
-
-/// Similar to `TableDesc::get_table_mut`, but allows for getting two different tables at one time.
-///
-/// SAFETY: A and B must represent distinct tables.
-#[allow(clippy::type_complexity)]
-pub(crate) unsafe fn get_two_tables_mut<
-    Storage: GeneratedStorage,
-    A: TableDesc<Storage = Storage> + Any,
-    B: TableDesc<Storage = Storage> + Any,
->(
-    storage: &mut Storage,
-) -> (
-    &mut Table<A, A::IndexStorage>,
-    &mut Table<B, B::IndexStorage>,
-) {
-    debug_assert_ne!(TypeId::of::<A>(), TypeId::of::<B>());
-
-    // SAFETY: `A` and `B` are different tables, so `get_table_mut` will return pointers to
-    // different `Table` objects.
-    let storage = storage as *mut _;
-    let a = A::get_table_mut(unsafe { &mut *storage });
-    let b = B::get_table_mut(unsafe { &mut *storage });
-    (a, b)
 }
 
 /// A table where changes can generate notifications to subscribers.
@@ -146,10 +141,21 @@ pub trait Indexable: TableDesc {
 
 /// Describes a table used as an index.
 ///
-/// SAFETY: The base table of an index must be distinct from the index table.
-pub unsafe trait IndexDesc: TableDesc {
+/// An index table is stored within its base table (in the base table's `indexes` field). The index
+/// table's values are keys of the base table.
+pub trait IndexDesc: TableDesc<Value: Hash + Eq + Clone> {
     /// The table which is indexed.
     type BaseTable: Notifiable + TableDesc<Storage = Self::Storage, Key = Self::Value>;
+
+    /// Get a reference to this index table from its base table.
+    fn index(
+        base: &Table<Self::BaseTable, <Self::BaseTable as TableDesc>::IndexStorage>,
+    ) -> &Table<Self, Self::IndexStorage>;
+
+    /// Get a mutable reference to this index table from its base table.
+    fn index_mut(
+        base: &mut Table<Self::BaseTable, <Self::BaseTable as TableDesc>::IndexStorage>,
+    ) -> &mut Table<Self, Self::IndexStorage>;
 }
 
 /// Operations on an index.
@@ -380,6 +386,12 @@ macro_rules! store {
                     &mut storage.$sname
                 }
 
+                unsafe fn value_ptr(storage: *mut Self::Storage) -> *mut $crate::storage::VersionedValue<Option<Self::Value>> {
+                    // SAFETY: `storage` is valid by the precondition of `value_ptr`; only a raw
+                    // pointer is created.
+                    unsafe { &raw mut (*storage).$sname }
+                }
+
                 fn notif_value(_value: &Option<Self::Value>) -> &Option<Self::NotificationValue> {
                     $crate::notification_value!(_value $(; notify($snotif))? )
                 }
@@ -411,8 +423,10 @@ macro_rules! store {
                 fn get_table(storage: &TableStorage) -> &$crate::storage::Table<Self, Self::IndexStorage> {
                     &storage.$name
                 }
-                fn get_table_mut(storage: &mut TableStorage) -> &mut $crate::storage::Table<Self, Self::IndexStorage> {
-                    &mut storage.$name
+                unsafe fn table_ptr(storage: *mut TableStorage) -> *mut $crate::storage::Table<Self, Self::IndexStorage> {
+                    // SAFETY: `storage` is valid by the precondition of `table_ptr`; only a raw
+                    // pointer is created.
+                    unsafe { &raw mut (*storage).$name }
                 }
                 fn make_txn_view<'a, 'b>(txn: &'b mut <Self::Storage as $crate::schema::GeneratedStorage>::Transaction<'a>) -> &'b mut $crate::TableTransaction<'a, Self::Storage, Self> {
                     &mut txn.$name
@@ -451,8 +465,10 @@ macro_rules! store {
                     fn get_table(storage: &TableStorage) -> &$crate::storage::Table<Self, Self::IndexStorage> {
                         &storage.$name.indexes.$field
                     }
-                    fn get_table_mut(storage: &mut TableStorage) -> &mut $crate::storage::Table<Self, Self::IndexStorage> {
-                        &mut storage.$name.indexes.$field
+                    unsafe fn table_ptr(storage: *mut TableStorage) -> *mut $crate::storage::Table<Self, Self::IndexStorage> {
+                        // SAFETY: `storage` is valid by the precondition of `table_ptr`; only a raw
+                        // pointer is created.
+                        unsafe { &raw mut (*storage).$name.indexes.$field }
                     }
                     fn make_txn_view<'a, 'b>(_txn: &'b mut <Self::Storage as $crate::schema::GeneratedStorage>::Transaction<'a>) -> &'b mut $crate::TableTransaction<'a, Self::Storage, Self> {
                         unreachable!()
@@ -461,9 +477,16 @@ macro_rules! store {
                     $crate::value_eq!(Self::Value);
                 }
 
-                // SAFETY: the base and index tables are distinct by construction.
-                unsafe impl $crate::schema::IndexDesc for index::$name::$field {
+                impl $crate::schema::IndexDesc for index::$name::$field {
                     type BaseTable = $name;
+
+                    fn index(base: &$crate::storage::Table<$name, index::$name::Storage>) -> &$crate::storage::Table<Self, Self::IndexStorage> {
+                        &base.indexes.$field
+                    }
+
+                    fn index_mut(base: &mut $crate::storage::Table<$name, index::$name::Storage>) -> &mut $crate::storage::Table<Self, Self::IndexStorage> {
+                        &mut base.indexes.$field
+                    }
                 }
             )*
         )*)?

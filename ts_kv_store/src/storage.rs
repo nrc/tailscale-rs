@@ -847,32 +847,18 @@ impl<D: schema::TableDesc, I: IndexStorage<D::Key, D::Value>> Table<D, I> {
         }
     }
 
-    /// Record that `key`'s value was mutated by `txn_id`.
+    /// Get a mutable iterator over the rows of the table whose keys satisfy `filter`.
     ///
-    /// Only needed by callers which mutate values without going via a method which records the
-    /// mutation itself (i.e., `iter_mut`, which cannot record keys while iterating because the
-    /// iterator borrows the table).
-    pub(crate) fn record_mutated_key(
-        &mut self,
-        key: &D::Key,
-        txn_id: TxnId,
-        max_committed_id: TxnId,
-    ) where
-        // Required because committing a recorded key compares values using `D::value_eq`, which
-        // panics for value types without `PartialEq`.
-        D::Value: PartialEq,
-    {
-        record_mut_ref(&mut self.modified, key, txn_id, max_committed_id);
-    }
-
-    /// Get a mutable iterator over the table. Does not keep indexes up to date, nor record mutations.
-    /// The caller must call `rebuild_indexes_for_key` and `record_mutated_key` for any key the
-    /// iterator yields.
-    pub(crate) fn iter_mut<'a>(
+    /// Records each yielded row as mutated (so that it is rolled back and checked for changes on
+    /// commit), and removes each yielded row from the table's indexes. Does not re-index rows: the
+    /// caller must call `rebuild_indexes_for_key` for every key the iterator yields once it has
+    /// finished with the yielded values.
+    pub(crate) fn iter_mut<'a, F: FnMut(&D::Key) -> bool>(
         &'a mut self,
         txn_id: TxnId,
         max_committed_id: TxnId,
-    ) -> TableIteratorMut<'a, D, I> {
+        filter: F,
+    ) -> TableIteratorMut<'a, D, I, F> {
         debug_assert!(self.delete_mask.check_txn_id(txn_id));
 
         let (data, removed) = match &mut self.delete_mask {
@@ -884,6 +870,8 @@ impl<D: schema::TableDesc, I: IndexStorage<D::Key, D::Value>> Table<D, I> {
             data,
             removed,
             indexes: &mut self.indexes,
+            modified: &mut self.modified,
+            filter,
             txn_id,
             max_committed_id,
         }
@@ -1153,19 +1141,24 @@ impl<'a, D: schema::TableDesc> Iterator for TableIterator<'a, D> {
 /// Doesn't include the delete mask because of lifetime issues, so some pre-processing into `data`
 /// and `removed` is required, see `Table::iter_mut`.
 ///
-/// Indexes for yielded key/value pairs are cleared, the caller is responsible for rebuilding the
-/// indexes.
-pub(crate) struct TableIteratorMut<'a, D: schema::TableDesc, I> {
+/// Only rows whose keys satisfy `filter` are yielded (other rows are not cloned or de-indexed).
+/// Yielded rows are recorded as mutated and their index entries are removed; the caller is
+/// responsible for rebuilding the indexes.
+pub(crate) struct TableIteratorMut<'a, D: schema::TableDesc, I, F> {
     data: std::collections::hash_map::IterMut<'a, D::Key, VersionedValue<D::Value>>,
     removed: Option<&'a HashSet<D::Key>>,
     indexes: &'a mut I,
+    modified: &'a mut Option<TxnMutations<D::Key>>,
+    filter: F,
     txn_id: TxnId,
     max_committed_id: TxnId,
 }
 
-impl<'a, D: schema::TableDesc, I: IndexStorage<D::Key, D::Value>> Iterator
-    for TableIteratorMut<'a, D, I>
+impl<'a, D: schema::TableDesc, I: IndexStorage<D::Key, D::Value>, F: FnMut(&D::Key) -> bool>
+    Iterator for TableIteratorMut<'a, D, I, F>
 where
+    // `PartialEq` is required because committing a key recorded as mutated compares values using
+    // `D::value_eq`, which panics for value types without `PartialEq`.
     D::Value: Clone + PartialEq,
 {
     type Item = (&'a D::Key, &'a mut D::Value);
@@ -1177,8 +1170,14 @@ where
             {
                 continue;
             }
+            if !(self.filter)(k) {
+                continue;
+            }
             match v.internal_clone(self.txn_id) {
                 Some(v) => {
+                    // Recorded before the value is yielded so that the (already cloned) value is
+                    // rolled back by `gc_txn` whatever happens next.
+                    record_mut_ref(self.modified, k, self.txn_id, self.max_committed_id);
                     // Remove this row's current index entries; they must be rebuilt from the (possibly
                     // mutated) value after iteration finishes.
                     self.indexes

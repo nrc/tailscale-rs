@@ -397,3 +397,92 @@ impl<T> KvErrorExt<T> for Result<T> {
         matches!(self, Err(Error::NotPresent))
     }
 }
+
+/// Uses of the API which would be unsound, and so must not compile.
+///
+/// Two indexes of a table cannot be used at the same time within a transaction (both give mutable
+/// access to the table):
+///
+/// ```compile_fail,E0499
+/// # use ts_kv_store::{Owner, store};
+/// # const OWNER: Owner = "owner";
+/// # #[derive(Clone, PartialEq)]
+/// # pub struct Row { a: u32, b: u32 }
+/// store!(tables: { Rows(u32 => Row; OWNER; index(a: u32); index(b: u32)) });
+///
+/// fn main() {
+///     let store = KvStore::new();
+///     let mut txn = store.begin_transaction(OWNER);
+///     let a = txn.Rows.indexes().a();
+///     let mut b = txn.Rows.indexes().b();
+///     b.with_mut(&0, |_, v| v.a = 1).unwrap();
+///     let _ = a.keys().count();
+/// }
+/// ```
+///
+/// References from a non-transactional iterator cannot outlive the iteration (and thus the lock on
+/// the store):
+///
+/// ```compile_fail
+/// # use ts_kv_store::{Owner, store};
+/// # const OWNER: Owner = "owner";
+/// store!(tables: { Items(u32 => String; OWNER) });
+///
+/// fn main() {
+///     let store = KvStore::new();
+///     let v = store.Items.with_iter(OWNER, |i| i.next().unwrap().1);
+///     store.Items.remove(OWNER, &1);
+///     println!("{v}");
+/// }
+/// ```
+///
+/// References from a transaction cannot outlive the transaction:
+///
+/// ```compile_fail,E0597
+/// # use ts_kv_store::{Owner, store};
+/// # const OWNER: Owner = "owner";
+/// store!(tables: { Items(u32 => String; OWNER) });
+///
+/// fn main() {
+///     let store = KvStore::new();
+///     let v = {
+///         let txn = store.begin_ro_transaction(OWNER);
+///         txn.Items.iter().next().unwrap().1
+///     };
+///     println!("{v}");
+/// }
+/// ```
+///
+/// Mutable references from a mutable iterator cannot outlive the iteration (after which the
+/// table's indexes are rebuilt from the values):
+///
+/// ```compile_fail
+/// # use ts_kv_store::{Owner, store};
+/// # const OWNER: Owner = "owner";
+/// store!(tables: { Items(u32 => String; OWNER) });
+///
+/// fn main() {
+///     let store = KvStore::new();
+///     let mut txn = store.begin_transaction(OWNER);
+///     let v = txn.Items.with_iter_mut(|i| i.next().unwrap().1);
+///     v.push('!');
+/// }
+/// ```
+///
+/// Transactional index views cannot be created from arbitrary pointers:
+///
+/// ```compile_fail,E0277
+/// # use ts_kv_store::{Owner, store};
+/// # const OWNER: Owner = "owner";
+/// # #[derive(Clone, PartialEq)]
+/// # pub struct Row { a: u32 }
+/// store!(tables: { Rows(u32 => Row; OWNER; index(a: u32)) });
+///
+/// fn main() {
+///     let _ = index::Rows::TransactionIndexes::from(
+///         std::ptr::null_mut::<ts_kv_store::Transaction<TableStorage>>(),
+///     );
+/// }
+/// ```
+#[cfg(doctest)]
+pub struct CompileFailTests;

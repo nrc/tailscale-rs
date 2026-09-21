@@ -1335,4 +1335,16 @@ mod test {
         store.Count.insert(OWNER, 1);
         store.with_owner(OTHER).Count.insert(2);
     }
+
+    #[test]
+    fn swapped_store_fields_stay_valid() {
+        let mut a = KvStore::new();
+        let mut b = KvStore::new();
+        std::mem::swap(&mut a.Items, &mut b.Items);
+        drop(b);
+        // `a.Items` now accesses `b`'s store, which must still be alive.
+        a.Items.insert(OWNER, "k", "v".to_owned());
+        assert_eq!(a.Items.get(OWNER, "k"), Some("v".to_owned()));
+        assert!(a.begin_ro_transaction(OWNER).Items.get(&"k").is_none());
+    }
 }

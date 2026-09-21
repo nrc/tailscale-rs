@@ -1638,6 +1638,40 @@ mod test_transactional_index {
         assert_eq!(store.Users.get(OWNER, &1), Some(row("Alice")));
         assert_eq!(store.Users.get(OWNER, &2), Some(row("Bob")));
     }
+
+    // Rows inserted after a `clear()` live in the index's delete mask; iterating the index mutably
+    // must not free the index keys it yields (the index is updated while iterating).
+    #[test]
+    fn txn_index_with_iter_mut_after_clear() {
+        let store = KvStore::new();
+        store.Users.insert(OWNER, 1, row("Alice"));
+        let mut txn = store.begin_transaction(OWNER);
+        txn.Users.clear();
+        txn.Users.insert(2, row("Bob"));
+        txn.Users.insert(3, row("Carol"));
+
+        let mut seen: Vec<_> = txn.Users.indexes().name().with_iter_mut(|i| {
+            i.map(|(k, bk, v)| {
+                v.name.push('!');
+                (k.clone(), *bk)
+            })
+            .collect()
+        });
+        seen.sort();
+        assert_eq!(seen, vec![("Bob".to_owned(), 2), ("Carol".to_owned(), 3)]);
+
+        assert!(txn.Users.indexes().name().get("Bob").is_none());
+        assert_eq!(
+            txn.Users.indexes().name().get("Bob!").unwrap(),
+            (2, row("Bob!"))
+        );
+        txn.commit().unwrap();
+        assert!(store.Users.indexes().name.get(OWNER, "Alice").is_none());
+        assert_eq!(
+            store.Users.indexes().name.get(OWNER, "Carol!").unwrap(),
+            (3, row("Carol!"))
+        );
+    }
 }
 
 #[cfg(test)]

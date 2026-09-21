@@ -2292,4 +2292,78 @@ mod test {
         assert_eq!(items.get(&"k"), Some("v".to_owned()));
         assert_eq!(counters.get(&1), Some(7));
     }
+
+    #[test]
+    fn views_of_different_tables_can_be_used_mutably_at_once() {
+        let store = KvStore::new();
+        store.Items.insert(OWNER, "a", "x".to_owned());
+        store.Items.insert(OWNER, "b", "y".to_owned());
+        store.Count.insert(OWNER, 0);
+
+        let mut txn = store.begin_transaction(OWNER);
+        txn.Items.with_iter_mut(|i| {
+            for (k, v) in i {
+                v.push('!');
+                txn.Counters.insert(k.len() as u32, 1);
+                txn.Count.with_mut(|c| *c += 1);
+            }
+        });
+        let counters = &txn.Counters;
+        txn.Count.with_mut(|c| *c += counters.len() as u64);
+        txn.commit().unwrap();
+
+        assert_eq!(store.Items.get(OWNER, "a"), Some("x!".to_owned()));
+        assert_eq!(store.Items.get(OWNER, "b"), Some("y!".to_owned()));
+        assert_eq!(store.Count.get(OWNER), Some(3));
+    }
+
+    #[test]
+    fn swapped_ro_txn_views_stay_valid() {
+        let store = KvStore::new();
+        store.Items.insert(OWNER, "k", "v".to_owned());
+
+        let mut t1 = store.begin_ro_transaction(OWNER);
+        let mut t2 = store.begin_ro_transaction(OWNER);
+        std::mem::swap(&mut t1.Items, &mut t2.Items);
+        drop(t2);
+        // `t1.Items` belongs to `t2`, which must still be alive (and hold its lock).
+        assert_eq!(t1.Items.get(&"k"), Some("v".to_owned()));
+        assert!(store.try_begin_transaction(OWNER).is_none());
+        drop(t1);
+        assert!(store.try_begin_transaction(OWNER).is_some());
+    }
+
+    #[test]
+    fn swapped_txn_view_keeps_its_store_locked() {
+        let store1 = KvStore::new();
+        let store2 = KvStore::new();
+
+        let mut t1 = store1.begin_transaction(OWNER);
+        let mut t2 = store2.begin_transaction(OWNER);
+        std::mem::swap(&mut t1.Items, &mut t2.Items);
+        drop(t2);
+
+        // `t1.Items` is a view of `store2`'s transaction, which is still in progress.
+        t1.Items.insert("k", "v".to_owned());
+        assert_eq!(t1.Items.get(&"k"), Some("v".to_owned()));
+        assert!(store2.try_begin_ro_transaction(OWNER).is_none());
+
+        // Dropping the last view of `store2`'s transaction rolls it back and releases the lock.
+        drop(t1);
+        assert!(store2.Items.get(OWNER, "k").is_none());
+        assert!(store1.try_begin_transaction(OWNER).is_some());
+        assert!(store2.try_begin_transaction(OWNER).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "fields are held elsewhere")]
+    fn commit_panics_if_a_view_is_held_by_another_transaction() {
+        let store1 = KvStore::new();
+        let store2 = KvStore::new();
+
+        let mut t1 = store1.begin_transaction(OWNER);
+        let mut t2 = store2.begin_transaction(OWNER);
+        std::mem::swap(&mut t1.Items, &mut t2.Items);
+        let _ = t2.commit();
+    }
 }

@@ -38,6 +38,15 @@ where
     Ok(result)
 }
 
+/// Apply `f` to the index `D` of `store` (not as part of any transaction).
+fn read_index<D: IndexDesc, T>(
+    store: &KvStore<D::Storage>,
+    f: impl FnOnce(IndexRef<'_, D>) -> T,
+) -> T {
+    let guard = store.get_read_lock();
+    f(IndexRef::new(TableRef::from_storage(&guard)))
+}
+
 /// An abstraction for operating on a table of key/values pairs via an index.
 ///
 /// `Index` has no transactional semantics and only exists as a convenience for accessing tabular
@@ -64,13 +73,13 @@ impl<'store, D: IndexDesc> Index<'store, D> {
 
     /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
-        <&Self as IndexedOps<_>>::check_consistent(self)
+        read_index::<D, _>(self.store, |index| index.check_consistent())
     }
 
     /// Get a row of the table from the store by cloning the value.
     ///
     /// Returns `Error::NotPresent` if there is no value for the specified key.
-    pub fn get<Q>(&self, owner: Owner, key: &Q) -> Result<(BaseKey<D>, BaseValue<D>)>
+    pub fn get<Q>(&self, _owner: Owner, key: &Q) -> Result<(BaseKey<D>, BaseValue<D>)>
     where
         BaseKey<D>: Clone,
         BaseValue<D>: Clone,
@@ -78,7 +87,9 @@ impl<'store, D: IndexDesc> Index<'store, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::get(self, key, owner)
+        read_index::<D, _>(self.store, |index| {
+            index.get(key).map(|(k, v)| (k.clone(), v.clone()))
+        })
     }
 
     /// Get immutable access to a row of the table in the store by reference.
@@ -86,7 +97,7 @@ impl<'store, D: IndexDesc> Index<'store, D> {
     /// Returns `Error::NotPresent` (and does not call `f`) if there is no value for the specified key.
     pub fn with<Q, T>(
         &self,
-        owner: Owner,
+        _owner: Owner,
         key: &Q,
         f: impl FnOnce(&BaseKey<D>, &BaseValue<D>) -> T,
     ) -> Result<T>
@@ -95,7 +106,7 @@ impl<'store, D: IndexDesc> Index<'store, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, owner)
+        read_index::<D, _>(self.store, |index| index.get(key).map(|(k, v)| f(k, v)))
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -114,9 +125,7 @@ impl<'store, D: IndexDesc> Index<'store, D> {
         BaseValue<D>: Clone + PartialEq,
         IndexValue<D>: Eq + Hash,
     {
-        in_index_txn::<D, _>(self.store, owner, |view| {
-            IndexedOpsMut::with_mut(view, key, f, owner)
-        })?
+        in_index_txn::<D, _>(self.store, owner, |view| view.with_mut(key, f))?
     }
 
     /// Remove a row from the table.
@@ -127,62 +136,46 @@ impl<'store, D: IndexDesc> Index<'store, D> {
         IndexValue<D>: Eq + Hash + ToOwned<Owned = BaseKey<D>>,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_index_txn::<D, _>(self.store, owner, |view| {
-            IndexedOpsMut::remove(view, key, owner)
-        })
-        .unwrap()
+        in_index_txn::<D, _>(self.store, owner, |view| view.remove(key)).unwrap()
     }
 
-    /// Iterate all the keys in the index and value in the base table.
-    pub fn iter(
-        &self,
-        owner: Owner,
-    ) -> impl Iterator<Item = (&'store D::Key, &'store BaseKey<D>, &'store BaseValue<D>)>
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        <&Self as IndexedOps<_>>::iter(self, owner)
-    }
-
-    /// Iterate all the keys in the index.
-    pub fn keys(&self, owner: Owner) -> impl Iterator<Item = &'store D::Key>
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        <&Self as IndexedOps<_>>::keys(self, owner)
-    }
-
-    /// Iterate all the key/value pairs in a table.
+    /// Pass an iterator over all the keys in the index and values in the base table to `f`.
     ///
-    /// If you need a mutable iterator without access scoped by a closure, use `iter_mut` within a
-    /// transaction.
-    pub fn with_iter_mut<F, T>(&self, owner: Owner, mut f: F) -> T
+    /// The store is locked for reading while `f` is called. Access is scoped by a closure (rather
+    /// than returning an iterator) so that the yielded references cannot outlive the lock.
+    pub fn with_iter<F, T>(&self, _owner: Owner, f: F) -> T
     where
-        F: for<'a> FnMut(
-            &mut dyn Iterator<Item = (&D::Key, &'a BaseKey<D>, &'a mut BaseValue<D>)>,
+        F: for<'a> FnOnce(
+            &mut dyn Iterator<Item = (&'a D::Key, &'a BaseKey<D>, &'a BaseValue<D>)>,
+        ) -> T,
+        IndexValue<D>: Eq + Hash,
+    {
+        read_index::<D, _>(self.store, |index| f(&mut index.iter::<KeysAndValues>()))
+    }
+
+    /// Pass an iterator over all the keys in the index to `f`.
+    ///
+    /// See [`Self::with_iter`] for why access is scoped by a closure.
+    pub fn with_keys<F, T>(&self, _owner: Owner, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a D::Key>) -> T,
+    {
+        read_index::<D, _>(self.store, |index| f(&mut index.iter::<Keys>()))
+    }
+
+    /// Pass an iterator over all the key/value pairs in the table, with mutable access to the
+    /// values, to `f`.
+    pub fn with_iter_mut<F, T>(&self, owner: Owner, f: F) -> T
+    where
+        F: for<'a> FnOnce(
+            &mut dyn Iterator<Item = (&'a D::Key, &'a BaseKey<D>, &'a mut BaseValue<D>)>,
         ) -> T,
         IndexValue<D>: Eq + Hash + Clone,
         BaseValue<D>: Clone + PartialEq,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_index_txn::<D, _>(self.store, owner, |view| {
-            let mut iter = IndexedOpsMut::iter_mut(view, owner);
-            f(&mut iter)
-        })
-        .unwrap()
+        in_index_txn::<D, _>(self.store, owner, |view| view.with_iter_mut(f)).unwrap()
     }
-}
-
-impl<'store, D: IndexDesc> Ops<D::Storage> for &Index<'store, D> {
-    type ReadLock = RwLockReadGuard<'store, Storage<D::Storage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        self.store.get_read_lock()
-    }
-}
-
-impl<D: IndexDesc> IndexedOps<D::Storage> for &Index<'_, D> {
-    type IndexDesc = D;
 }
 
 /// An abstraction for operating on a table of key/values pairs via an index, with a fixed owner.
@@ -193,24 +186,22 @@ impl<D: IndexDesc> IndexedOps<D::Storage> for &Index<'_, D> {
 ///
 /// `D` describes the index table, its base table is `D::BaseTable`.
 pub struct IndexWithOwner<'store, D: IndexDesc> {
-    store: &'store KvStore<D::Storage>,
+    inner: Index<'store, D>,
     owner: Owner,
-    desc: PhantomData<D>,
 }
 
 impl<'store, D: IndexDesc> IndexWithOwner<'store, D> {
     #[doc(hidden)]
     pub fn new(store: &'store KvStore<D::Storage>, owner: Owner) -> Self {
         IndexWithOwner {
-            store,
+            inner: Index::new(store),
             owner,
-            desc: PhantomData,
         }
     }
 
     /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
-        <&Self as IndexedOps<_>>::check_consistent(self)
+        self.inner.check_consistent()
     }
 
     /// Get a row of the table from the store by cloning the value.
@@ -224,7 +215,7 @@ impl<'store, D: IndexDesc> IndexWithOwner<'store, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::get(self, key, self.owner)
+        self.inner.get(self.owner, key)
     }
 
     /// Get immutable access to a row of the table in the store by reference.
@@ -236,7 +227,7 @@ impl<'store, D: IndexDesc> IndexWithOwner<'store, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.owner)
+        self.inner.with(self.owner, key, f)
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -254,9 +245,7 @@ impl<'store, D: IndexDesc> IndexWithOwner<'store, D> {
         BaseValue<D>: Clone + PartialEq,
         IndexValue<D>: Eq + Hash,
     {
-        in_index_txn::<D, _>(self.store, self.owner, |view| {
-            IndexedOpsMut::with_mut(view, key, f, self.owner)
-        })?
+        self.inner.with_mut(self.owner, key, f)
     }
 
     /// Remove a row from the table.
@@ -266,62 +255,44 @@ impl<'store, D: IndexDesc> IndexWithOwner<'store, D> {
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
         IndexValue<D>: Eq + Hash + ToOwned<Owned = BaseKey<D>>,
     {
-        // Should never panic since transaction should only fail on index inserts.
-        in_index_txn::<D, _>(self.store, self.owner, |view| {
-            IndexedOpsMut::remove(view, key, self.owner)
-        })
-        .unwrap()
+        self.inner.remove(self.owner, key)
     }
 
-    /// Iterate all the keys in the index and value in the base table.
-    pub fn iter(
-        &self,
-    ) -> impl Iterator<Item = (&'store D::Key, &'store BaseKey<D>, &'store BaseValue<D>)>
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        <&Self as IndexedOps<_>>::iter(self, self.owner)
-    }
-
-    /// Iterate all the keys in the index.
-    pub fn keys(&self) -> impl Iterator<Item = &'store D::Key>
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        <&Self as IndexedOps<_>>::keys(self, self.owner)
-    }
-
-    /// Iterate all the key/value pairs in a table.
+    /// Pass an iterator over all the keys in the index and values in the base table to `f`.
     ///
-    /// If you need a mutable iterator without access scoped by a closure, use `iter_mut` within a
-    /// transaction.
-    pub fn with_iter_mut<F, T>(&self, mut f: F) -> T
+    /// See [`Index::with_iter`] for why access is scoped by a closure.
+    pub fn with_iter<F, T>(&self, f: F) -> T
     where
-        F: for<'a> FnMut(
-            &mut dyn Iterator<Item = (&D::Key, &'a BaseKey<D>, &'a mut BaseValue<D>)>,
+        F: for<'a> FnOnce(
+            &mut dyn Iterator<Item = (&'a D::Key, &'a BaseKey<D>, &'a BaseValue<D>)>,
+        ) -> T,
+        IndexValue<D>: Eq + Hash,
+    {
+        self.inner.with_iter(self.owner, f)
+    }
+
+    /// Pass an iterator over all the keys in the index to `f`.
+    ///
+    /// See [`Index::with_iter`] for why access is scoped by a closure.
+    pub fn with_keys<F, T>(&self, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a D::Key>) -> T,
+    {
+        self.inner.with_keys(self.owner, f)
+    }
+
+    /// Pass an iterator over all the key/value pairs in the table, with mutable access to the
+    /// values, to `f`.
+    pub fn with_iter_mut<F, T>(&self, f: F) -> T
+    where
+        F: for<'a> FnOnce(
+            &mut dyn Iterator<Item = (&'a D::Key, &'a BaseKey<D>, &'a mut BaseValue<D>)>,
         ) -> T,
         IndexValue<D>: Eq + Hash + Clone,
         BaseValue<D>: Clone + PartialEq,
     {
-        // Should never panic since transaction should only fail on index inserts.
-        in_index_txn::<D, _>(self.store, self.owner, |view| {
-            let mut iter = IndexedOpsMut::iter_mut(view, self.owner);
-            f(&mut iter)
-        })
-        .unwrap()
+        self.inner.with_iter_mut(self.owner, f)
     }
-}
-
-impl<'store, D: IndexDesc> Ops<D::Storage> for &IndexWithOwner<'store, D> {
-    type ReadLock = RwLockReadGuard<'store, Storage<D::Storage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        self.store.get_read_lock()
-    }
-}
-
-impl<D: IndexDesc> IndexedOps<D::Storage> for &IndexWithOwner<'_, D> {
-    type IndexDesc = D;
 }
 
 /// An abstraction for operating on a table of key/values pairs (accessed as part of a transaction)

@@ -1,10 +1,16 @@
 //! KvStore non-transactional API.
 
-use std::{borrow::Borrow, hash::Hash, marker::PhantomData, sync::Arc};
+use std::{
+    borrow::Borrow,
+    hash::Hash,
+    marker::PhantomData,
+    sync::{Arc, RwLockReadGuard},
+};
 
 use crate::{
     Error, KvStore, Owner, Result, SingletonTransaction, TableTransaction,
-    operations::{Ops, SingletonOps, SingletonOpsMut, StorageGuard, TabularOps, TabularOpsMut},
+    iter::{Keys, KeysAndValues, Values},
+    operations::{SingletonRef, TableRef},
     schema,
     storage::Storage,
     transactions::SchemaTransaction,
@@ -38,6 +44,10 @@ impl<
         &self.store
     }
 
+    fn read_lock(&self) -> RwLockReadGuard<'_, Storage<TableStorage>> {
+        self.store.get_read_lock()
+    }
+
     /// Subscribe to a singleton key-value pair.
     pub fn subscribe(
         &self,
@@ -58,7 +68,7 @@ impl<
         let subs = &storage.subscriptions;
         let id = subs.create_singleton_subscription::<S>(subscriber.into())?;
 
-        crate::pub_sub::send_current_singleton::<S>(subs, storage.storage(), id);
+        crate::pub_sub::send_current_singleton::<S>(subs, &storage, id);
 
         Ok(id)
     }
@@ -73,18 +83,22 @@ impl<
     /// Get a single value from the store by cloning the value.
     ///
     /// Returns `None` if there is no value for the specified key.
-    pub fn get(&self, owner: Owner) -> Option<S::Value>
+    pub fn get(&self, _owner: Owner) -> Option<S::Value>
     where
         S::Value: Clone,
     {
-        <&Self as SingletonOps<_>>::get::<S>(self, owner)
+        SingletonRef::<S>::from_storage(&self.read_lock())
+            .get()
+            .cloned()
     }
 
     /// Get immutable access to a value in the store by reference.
     ///
     /// Returns `None` (and does not call `f`) if there is no value for the specified key.
-    pub fn with<T>(&self, owner: Owner, f: impl FnOnce(&S::Value) -> T) -> Option<T> {
-        <&Self as SingletonOps<_>>::with::<S, T>(self, f, owner)
+    pub fn with<T>(&self, _owner: Owner, f: impl FnOnce(&S::Value) -> T) -> Option<T> {
+        SingletonRef::<S>::from_storage(&self.read_lock())
+            .get()
+            .map(f)
     }
 
     /// Get mutable access to a value in the store by reference.
@@ -95,49 +109,20 @@ impl<
         S::Value: Clone + PartialEq,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_singleton_txn::<_, S, _>(self.store(), owner, |view| {
-            SingletonOpsMut::with_mut::<S, T>(view, f, owner)
-        })
-        .unwrap()
+        in_singleton_txn::<_, S, _>(self.store(), owner, |view| view.with_mut(f)).unwrap()
     }
 
     /// Insert a single value into the store.
     pub fn insert(&self, owner: Owner, value: S::Value) {
         // Should never panic since transaction should only fail on index inserts.
-        in_singleton_txn::<_, S, _>(self.store(), owner, |view| {
-            SingletonOpsMut::insert::<S>(view, value, owner)
-        })
-        .unwrap()
+        in_singleton_txn::<_, S, _>(self.store(), owner, |view| view.insert(value)).unwrap()
     }
 
     /// Remove a single value from the store.
     pub fn remove(&self, owner: Owner) {
         // Should never panic since transaction should only fail on index inserts.
-        in_singleton_txn::<_, S, _>(self.store(), owner, |view| {
-            SingletonOpsMut::remove::<S>(view, owner)
-        })
-        .unwrap()
+        in_singleton_txn::<_, S, _>(self.store(), owner, |view| view.remove()).unwrap()
     }
-}
-
-impl<
-    'store,
-    TableStorage: schema::GeneratedStorage + 'static,
-    S: schema::SingletonDesc<Storage = TableStorage>,
-> Ops<TableStorage> for &'store Singleton<TableStorage, S>
-{
-    type ReadLock = std::sync::RwLockReadGuard<'store, Storage<TableStorage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        self.store.get_read_lock()
-    }
-}
-
-impl<
-    TableStorage: schema::GeneratedStorage + 'static,
-    S: schema::SingletonDesc<Storage = TableStorage>,
-> SingletonOps<TableStorage> for &Singleton<TableStorage, S>
-{
 }
 
 /// Apply `f` to `S`'s view of a transaction which contains only that operation, and commit it.
@@ -185,46 +170,48 @@ impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Stor
         &self.store
     }
 
+    /// Apply `f` to the table (not as part of any transaction).
+    fn read<T>(&self, f: impl FnOnce(TableRef<'_, D>) -> T) -> T {
+        read_table(self.store(), f)
+    }
+
     /// The number of key/value pairs in the table.
     pub fn len(&self) -> usize {
-        <&Self as TabularOps<_>>::len(self)
+        self.read(|t| t.len())
     }
 
     /// True if the table is empty.
     pub fn is_empty(&self) -> bool {
-        <&Self as TabularOps<_>>::is_empty(self)
+        self.read(|t| t.is_empty())
     }
 
     /// Clear a table by removing all its KVs.
     pub fn clear(&self, owner: Owner) {
         // Should never panic since transaction should only fail on index inserts.
-        in_table_txn::<_, D, _>(self.store(), owner, |view| {
-            TabularOpsMut::clear(view, owner)
-        })
-        .unwrap()
+        in_table_txn::<_, D, _>(self.store(), owner, |view| view.clear()).unwrap()
     }
 
     /// Get a row of the table from the store by cloning the value.
     ///
     /// Returns `None` if there is no value for the specified key.
-    pub fn get<Q>(&self, owner: Owner, key: &Q) -> Option<D::Value>
+    pub fn get<Q>(&self, _owner: Owner, key: &Q) -> Option<D::Value>
     where
         D::Value: Clone,
         D::Key: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        <&Self as TabularOps<_>>::get(self, key, owner)
+        self.read(|t| t.get(key).cloned())
     }
 
     /// Get immutable access to a row of the table in the store by reference.
     ///
     /// Returns `None` (and does not call `f`) if there is no value for the specified key.
-    pub fn with<Q, T>(&self, owner: Owner, key: &Q, f: impl FnOnce(&D::Value) -> T) -> Option<T>
+    pub fn with<Q, T>(&self, _owner: Owner, key: &Q, f: impl FnOnce(&D::Value) -> T) -> Option<T>
     where
         D::Key: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        <&Self as TabularOps<_>>::with(self, key, f, owner)
+        self.read(|t| t.get(key).map(f))
     }
 
     /// Insert a `value` into the table.
@@ -238,9 +225,7 @@ impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Stor
     ///
     /// Returns an error if `insert` would panic.
     pub fn try_insert(&self, owner: Owner, key: D::Key, value: D::Value) -> Result<()> {
-        in_table_txn::<_, D, _>(self.store(), owner, |view| {
-            TabularOpsMut::insert(view, key, value, owner)
-        })
+        in_table_txn::<_, D, _>(self.store(), owner, |view| view.insert(key, value))
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -257,10 +242,8 @@ impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Stor
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
         D::Value: Clone + PartialEq,
     {
-        in_table_txn::<_, D, _>(self.store(), owner, |view| {
-            TabularOpsMut::with_mut(view, key, f, owner)
-        })?
-        .ok_or(Error::NotPresent)
+        in_table_txn::<_, D, _>(self.store(), owner, |view| view.with_mut(key, f))?
+            .ok_or(Error::NotPresent)
     }
 
     /// Remove a row from the table.
@@ -270,42 +253,50 @@ impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Stor
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_table_txn::<_, D, _>(self.store(), owner, |view| {
-            TabularOpsMut::remove(view, key, owner)
-        })
-        .unwrap()
+        in_table_txn::<_, D, _>(self.store(), owner, |view| view.remove(key)).unwrap()
     }
 
-    /// Iterate all the key/value pairs in a table.
-    pub fn iter(&self, owner: Owner) -> impl Iterator<Item = (&D::Key, &D::Value)> {
-        <&Self as TabularOps<_>>::iter(self, owner)
-    }
-
-    /// Iterate all the keys in a table.
-    pub fn keys(&self, owner: Owner) -> impl Iterator<Item = &D::Key> {
-        <&Self as TabularOps<_>>::keys(self, owner)
-    }
-
-    /// Iterate all the values in a table.
-    pub fn values(&self, owner: Owner) -> impl Iterator<Item = &D::Value> {
-        <&Self as TabularOps<_>>::values(self, owner)
-    }
-
-    /// Iterate all the key/value pairs in a table.
+    /// Pass an iterator over all the key/value pairs in the table to `f`.
     ///
-    /// If you need a mutable iterator without access scoped by a closure, use `iter_mut` within a
-    /// transaction.
-    pub fn with_iter_mut<F, T>(&self, owner: Owner, mut f: F) -> T
+    /// The store is locked for reading while `f` is called. Access is scoped by a closure (rather
+    /// than returning an iterator) so that the yielded references cannot outlive the lock. Use
+    /// `iter` within a (read-only) transaction for an iterator.
+    pub fn with_iter<F, T>(&self, _owner: Owner, f: F) -> T
     where
-        F: for<'a> FnMut(&mut dyn Iterator<Item = (&'a D::Key, &'a mut D::Value)>) -> T,
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = (&'a D::Key, &'a D::Value)>) -> T,
+    {
+        self.read(|t| f(&mut t.iter::<KeysAndValues>()))
+    }
+
+    /// Pass an iterator over all the keys in the table to `f`.
+    ///
+    /// See `with_iter` for why access is scoped by a closure.
+    pub fn with_keys<F, T>(&self, _owner: Owner, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a D::Key>) -> T,
+    {
+        self.read(|t| f(&mut t.iter::<Keys>()))
+    }
+
+    /// Pass an iterator over all the values in the table to `f`.
+    ///
+    /// See `with_iter` for why access is scoped by a closure.
+    pub fn with_values<F, T>(&self, _owner: Owner, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a D::Value>) -> T,
+    {
+        self.read(|t| f(&mut t.iter::<Values>()))
+    }
+
+    /// Pass an iterator over all the key/value pairs in the table, with mutable access to the
+    /// values, to `f`.
+    pub fn with_iter_mut<F, T>(&self, owner: Owner, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = (&'a D::Key, &'a mut D::Value)>) -> T,
         D::Value: Clone + PartialEq,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_table_txn::<_, D, _>(self.store(), owner, |view| {
-            let mut iter = TabularOpsMut::iter_mut(view, owner);
-            f(&mut iter)
-        })
-        .unwrap()
+        in_table_txn::<_, D, _>(self.store(), owner, |view| view.with_iter_mut(f)).unwrap()
     }
 }
 
@@ -379,29 +370,23 @@ impl<
         let subs = &storage.subscriptions;
         let id = subs.create_table_subscription::<D>(key.clone(), subscriber.into())?;
 
-        crate::pub_sub::send_current::<D>(subs, storage.storage(), key, id);
+        crate::pub_sub::send_current::<D>(subs, &storage, key, id);
 
         Ok(id)
     }
 }
 
-impl<
-    'store,
+/// Apply `f` to `D`'s table in `store` (not as part of any transaction).
+fn read_table<TableStorage, D, T>(
+    store: &KvStore<TableStorage>,
+    f: impl FnOnce(TableRef<'_, D>) -> T,
+) -> T
+where
     TableStorage: schema::GeneratedStorage + 'static,
     D: schema::TableDesc<Storage = TableStorage>,
-> Ops<TableStorage> for &'store Table<TableStorage, D>
 {
-    type ReadLock = std::sync::RwLockReadGuard<'store, Storage<TableStorage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        self.store.get_read_lock()
-    }
-}
-
-impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Storage = TableStorage>>
-    TabularOps<TableStorage> for &Table<TableStorage, D>
-{
-    type TableDesc = D;
+    let guard = store.get_read_lock();
+    f(TableRef::from_storage(&guard))
 }
 
 /// Apply `f` to `D`'s view of a transaction which contains only that operation, and commit it.
@@ -453,6 +438,10 @@ impl<
         }
     }
 
+    fn read_lock(&self) -> RwLockReadGuard<'store, Storage<TableStorage>> {
+        self.store.get_read_lock()
+    }
+
     /// Subscribe to a singleton key-value pair.
     pub fn subscribe(&self, subscriber: crate::Subscriber) -> Result<crate::Subscription> {
         let subs = &self.read_lock().subscriptions;
@@ -470,7 +459,7 @@ impl<
         let subs = &storage.subscriptions;
         let id = subs.create_singleton_subscription::<S>(subscriber)?;
 
-        crate::pub_sub::send_current_singleton::<S>(subs, storage.storage(), id);
+        crate::pub_sub::send_current_singleton::<S>(subs, &storage, id);
 
         Ok(id)
     }
@@ -489,14 +478,18 @@ impl<
     where
         S::Value: Clone,
     {
-        <&Self as SingletonOps<_>>::get::<S>(self, self.owner)
+        SingletonRef::<S>::from_storage(&self.read_lock())
+            .get()
+            .cloned()
     }
 
     /// Get immutable access to a value in the store by reference.
     ///
     /// Returns `None` (and does not call `f`) if there is no value for the specified key.
     pub fn with<T>(&self, f: impl FnOnce(&S::Value) -> T) -> Option<T> {
-        <&Self as SingletonOps<_>>::with::<S, T>(self, f, self.owner)
+        SingletonRef::<S>::from_storage(&self.read_lock())
+            .get()
+            .map(f)
     }
 
     /// Get mutable access to a value in the store by reference.
@@ -507,49 +500,20 @@ impl<
         S::Value: Clone + PartialEq,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_singleton_txn::<_, S, _>(self.store, self.owner, |view| {
-            SingletonOpsMut::with_mut::<S, T>(view, f, self.owner)
-        })
-        .unwrap()
+        in_singleton_txn::<_, S, _>(self.store, self.owner, |view| view.with_mut(f)).unwrap()
     }
 
     /// Insert a single value into the store.
     pub fn insert(&self, value: S::Value) {
         // Should never panic since transaction should only fail on index inserts.
-        in_singleton_txn::<_, S, _>(self.store, self.owner, |view| {
-            SingletonOpsMut::insert::<S>(view, value, self.owner)
-        })
-        .unwrap()
+        in_singleton_txn::<_, S, _>(self.store, self.owner, |view| view.insert(value)).unwrap()
     }
 
     /// Remove a single value from the store.
     pub fn remove(&self) {
         // Should never panic since transaction should only fail on index inserts.
-        in_singleton_txn::<_, S, _>(self.store, self.owner, |view| {
-            SingletonOpsMut::remove::<S>(view, self.owner)
-        })
-        .unwrap()
+        in_singleton_txn::<_, S, _>(self.store, self.owner, |view| view.remove()).unwrap()
     }
-}
-
-impl<
-    'store,
-    TableStorage: schema::GeneratedStorage + 'static,
-    S: schema::SingletonDesc<Storage = TableStorage>,
-> Ops<TableStorage> for &SingletonWithOwner<'store, TableStorage, S>
-{
-    type ReadLock = std::sync::RwLockReadGuard<'store, Storage<TableStorage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        self.store.get_read_lock()
-    }
-}
-
-impl<
-    TableStorage: schema::GeneratedStorage + 'static,
-    S: schema::SingletonDesc<Storage = TableStorage>,
-> SingletonOps<TableStorage> for &SingletonWithOwner<'_, TableStorage, S>
-{
 }
 
 /// A table of key/value pairs in the store, accessed with a fixed owner.
@@ -582,23 +546,29 @@ impl<
         }
     }
 
+    fn read_lock(&self) -> RwLockReadGuard<'store, Storage<TableStorage>> {
+        self.store.get_read_lock()
+    }
+
+    /// Apply `f` to the table (not as part of any transaction).
+    fn read<T>(&self, f: impl FnOnce(TableRef<'_, D>) -> T) -> T {
+        read_table(self.store, f)
+    }
+
     /// The number of key/value pairs in the table.
     pub fn len(&self) -> usize {
-        <&Self as TabularOps<_>>::len(self)
+        self.read(|t| t.len())
     }
 
     /// True if the table is empty.
     pub fn is_empty(&self) -> bool {
-        <&Self as TabularOps<_>>::is_empty(self)
+        self.read(|t| t.is_empty())
     }
 
     /// Clear a table by removing all its KVs.
     pub fn clear(&self) {
         // Should never panic since transaction should only fail on index inserts.
-        in_table_txn::<_, D, _>(self.store, self.owner, |view| {
-            TabularOpsMut::clear(view, self.owner)
-        })
-        .unwrap()
+        in_table_txn::<_, D, _>(self.store, self.owner, |view| view.clear()).unwrap()
     }
 
     /// Get a row of the table from the store by cloning the value.
@@ -610,7 +580,7 @@ impl<
         D::Key: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        <&Self as TabularOps<_>>::get(self, key, self.owner)
+        self.read(|t| t.get(key).cloned())
     }
 
     /// Get immutable access to a row of the table in the store by reference.
@@ -621,7 +591,7 @@ impl<
         D::Key: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        <&Self as TabularOps<_>>::with(self, key, f, self.owner)
+        self.read(|t| t.get(key).map(f))
     }
 
     /// Insert a `value` into the table.
@@ -635,9 +605,7 @@ impl<
     ///
     /// Returns an error if `insert` would panic.
     pub fn try_insert(&self, key: D::Key, value: D::Value) -> Result<()> {
-        in_table_txn::<_, D, _>(self.store, self.owner, |view| {
-            TabularOpsMut::insert(view, key, value, self.owner)
-        })
+        in_table_txn::<_, D, _>(self.store, self.owner, |view| view.insert(key, value))
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -649,10 +617,8 @@ impl<
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
         D::Value: Clone + PartialEq,
     {
-        in_table_txn::<_, D, _>(self.store, self.owner, |view| {
-            TabularOpsMut::with_mut(view, key, f, self.owner)
-        })?
-        .ok_or(Error::NotPresent)
+        in_table_txn::<_, D, _>(self.store, self.owner, |view| view.with_mut(key, f))?
+            .ok_or(Error::NotPresent)
     }
 
     /// Remove a row from the table.
@@ -662,62 +628,51 @@ impl<
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_table_txn::<_, D, _>(self.store, self.owner, |view| {
-            TabularOpsMut::remove(view, key, self.owner)
-        })
-        .unwrap()
+        in_table_txn::<_, D, _>(self.store, self.owner, |view| view.remove(key)).unwrap()
     }
 
-    /// Iterate all the key/value pairs in a table.
-    pub fn iter(&self) -> impl Iterator<Item = (&'store D::Key, &'store D::Value)> {
-        <&Self as TabularOps<_>>::iter(self, self.owner)
-    }
-
-    /// Iterate all the keys in a table.
-    pub fn keys(&self) -> impl Iterator<Item = &'store D::Key> {
-        <&Self as TabularOps<_>>::keys(self, self.owner)
-    }
-
-    /// Iterate all the values in a table.
-    pub fn values(&self) -> impl Iterator<Item = &'store D::Value> {
-        <&Self as TabularOps<_>>::values(self, self.owner)
-    }
-
-    /// Iterate all the key/value pairs in a table.
+    /// Pass an iterator over all the key/value pairs in the table to `f`.
     ///
-    /// If you need a mutable iterator without access scoped by a closure, use `iter_mut` within a
-    /// transaction.
-    pub fn with_iter_mut<F, T>(&self, mut f: F) -> T
+    /// The store is locked for reading while `f` is called. Access is scoped by a closure (rather
+    /// than returning an iterator) so that the yielded references cannot outlive the lock. Use
+    /// `iter` within a (read-only) transaction for an iterator.
+    pub fn with_iter<F, T>(&self, f: F) -> T
     where
-        F: for<'a> FnMut(&mut dyn Iterator<Item = (&'a D::Key, &'a mut D::Value)>) -> T,
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = (&'a D::Key, &'a D::Value)>) -> T,
+    {
+        self.read(|t| f(&mut t.iter::<KeysAndValues>()))
+    }
+
+    /// Pass an iterator over all the keys in the table to `f`.
+    ///
+    /// See `with_iter` for why access is scoped by a closure.
+    pub fn with_keys<F, T>(&self, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a D::Key>) -> T,
+    {
+        self.read(|t| f(&mut t.iter::<Keys>()))
+    }
+
+    /// Pass an iterator over all the values in the table to `f`.
+    ///
+    /// See `with_iter` for why access is scoped by a closure.
+    pub fn with_values<F, T>(&self, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a D::Value>) -> T,
+    {
+        self.read(|t| f(&mut t.iter::<Values>()))
+    }
+
+    /// Pass an iterator over all the key/value pairs in the table, with mutable access to the
+    /// values, to `f`.
+    pub fn with_iter_mut<F, T>(&self, f: F) -> T
+    where
+        F: for<'a> FnOnce(&mut dyn Iterator<Item = (&'a D::Key, &'a mut D::Value)>) -> T,
         D::Value: Clone + PartialEq,
     {
         // Should never panic since transaction should only fail on index inserts.
-        in_table_txn::<_, D, _>(self.store, self.owner, |view| {
-            let mut iter = TabularOpsMut::iter_mut(view, self.owner);
-            f(&mut iter)
-        })
-        .unwrap()
+        in_table_txn::<_, D, _>(self.store, self.owner, |view| view.with_iter_mut(f)).unwrap()
     }
-}
-
-impl<
-    'store,
-    TableStorage: schema::GeneratedStorage + 'static,
-    D: schema::TableDesc<Storage = TableStorage>,
-> Ops<TableStorage> for &TableWithOwner<'store, TableStorage, D>
-{
-    type ReadLock = std::sync::RwLockReadGuard<'store, Storage<TableStorage>>;
-
-    fn read_lock(self) -> Self::ReadLock {
-        self.store.get_read_lock()
-    }
-}
-
-impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Storage = TableStorage>>
-    TabularOps<TableStorage> for &TableWithOwner<'_, TableStorage, D>
-{
-    type TableDesc = D;
 }
 
 impl<
@@ -794,7 +749,7 @@ impl<
         let subs = &storage.subscriptions;
         let id = subs.create_table_subscription::<D>(key.clone(), subscriber)?;
 
-        crate::pub_sub::send_current::<D>(subs, storage.storage(), key, id);
+        crate::pub_sub::send_current::<D>(subs, &storage, key, id);
 
         Ok(id)
     }

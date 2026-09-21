@@ -715,7 +715,7 @@ macro_rules! store {
         /// See [`$crate::KvStore`] (which this type implicitly derefences to) for full docs.
         #[allow(non_snake_case)]
         pub struct KvStore {
-            store: Box<$crate::KvStore<TableStorage>>,
+            store: std::sync::Arc<$crate::KvStore<TableStorage>>,
 
             $($(#[allow(dead_code)] pub $name: $crate::Table<TableStorage, $name>,)*)?
             $($(#[allow(dead_code)] pub $sname: $crate::Singleton<TableStorage, $sname>,)*)?
@@ -740,11 +740,10 @@ macro_rules! store {
             /// keeping the notifier alive (e.g. via the subscribers it hands out). Once the last
             /// strong reference is dropped the store stops sending notifications.
             pub fn from_notifier(notifier: std::sync::Weak<dyn $crate::Notifier<Notification = <TableStorage as $crate::schema::GeneratedStorage>::Notification>>) -> Self {
-                let store = Box::new($crate::KvStore::new_with_storage(std::sync::RwLock::new($crate::storage::Storage::new(notifier))));
-                let raw = store.as_ref() as *const $crate::KvStore<_>;
+                let store = std::sync::Arc::new($crate::KvStore::new_with_storage(std::sync::RwLock::new($crate::storage::Storage::new(notifier))));
                 KvStore {
-                    $($($name: unsafe { $crate::Table::new(raw) },)*)?
-                    $($($sname: unsafe { $crate::Singleton::new(raw) },)*)?
+                    $($($name: $crate::Table::new(std::sync::Arc::clone(&store)),)*)?
+                    $($($sname: $crate::Singleton::new(std::sync::Arc::clone(&store)),)*)?
                     store,
                 }
             }
@@ -752,7 +751,7 @@ macro_rules! store {
             /// A convenience for operating on the store with a specified owner.
             #[allow(dead_code)]
             pub fn with_owner(&self, owner: $crate::Owner) -> KvStoreWithOwner<'_> {
-                let store = self.store.as_ref();
+                let store: &$crate::KvStore<TableStorage> = &self.store;
                 KvStoreWithOwner {
                     $($($name: $crate::TableWithOwner::new(store, owner),)*)?
                     $($($sname: $crate::SingletonWithOwner::new(store, owner),)*)?
@@ -768,17 +767,11 @@ macro_rules! store {
             }
         }
 
-        // Blocks moving the per-table/singleton fields out of the store: they hold pointers
-        // back into it, so they must not outlive it.
-        impl Drop for KvStore {
-            fn drop(&mut self) {}
-        }
-
         impl std::ops::Deref for KvStore {
             type Target = $crate::KvStore<TableStorage>;
 
             fn deref(&self) -> &Self::Target {
-                self.store.as_ref()
+                &self.store
             }
         }
 
@@ -795,12 +788,6 @@ macro_rules! store {
 
             $($(#[allow(dead_code)] pub $name: $crate::TableWithOwner<'a, TableStorage, $name>,)*)?
             $($(#[allow(dead_code)] pub $sname: $crate::SingletonWithOwner<'a, TableStorage, $sname>,)*)?
-        }
-
-        // Blocks moving the per-table/singleton fields out of the store: they hold pointers back
-        // into the store this borrows, and the borrow is what keeps them valid.
-        impl<'a> Drop for KvStoreWithOwner<'a> {
-            fn drop(&mut self) {}
         }
 
         #[allow(dead_code)]

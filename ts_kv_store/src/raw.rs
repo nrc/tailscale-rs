@@ -1,6 +1,6 @@
 //! KvStore non-transactional API.
 
-use std::{borrow::Borrow, hash::Hash, marker::PhantomData};
+use std::{borrow::Borrow, hash::Hash, marker::PhantomData, sync::Arc};
 
 use crate::{
     Error, KvStore, Owner, Result, SingletonTransaction, TableTransaction,
@@ -17,24 +17,8 @@ pub struct Singleton<
     TableStorage: schema::GeneratedStorage + 'static,
     S: schema::SingletonDesc<Storage = TableStorage>,
 > {
-    /// Invariant: the store outlives `self`.
-    store: *const KvStore<TableStorage>,
+    store: Arc<KvStore<TableStorage>>,
     desc: PhantomData<S>,
-}
-
-// SAFETY: by the field invariant of `store`.
-unsafe impl<
-    TableStorage: schema::GeneratedStorage + 'static,
-    S: schema::SingletonDesc<Storage = TableStorage>,
-> Send for Singleton<TableStorage, S>
-{
-}
-// SAFETY: by the field invariant of `store` and because `KvStore` is `Sync`.
-unsafe impl<
-    TableStorage: schema::GeneratedStorage + 'static,
-    S: schema::SingletonDesc<Storage = TableStorage>,
-> Sync for Singleton<TableStorage, S>
-{
 }
 
 impl<
@@ -42,9 +26,8 @@ impl<
     S: schema::SingletonDesc<Storage = TableStorage>,
 > Singleton<TableStorage, S>
 {
-    /// SAFETY: the caller must ensure that the target of `store` will outlive `self`.
     #[doc(hidden)]
-    pub unsafe fn new(store: *const KvStore<TableStorage>) -> Self {
+    pub fn new(store: Arc<KvStore<TableStorage>>) -> Self {
         Singleton {
             store,
             desc: PhantomData,
@@ -52,8 +35,7 @@ impl<
     }
 
     fn store(&self) -> &KvStore<TableStorage> {
-        // SAFETY: safe since `self.store` must be live since `self` is (by it's field invariant).
-        unsafe { &(*self.store) }
+        &self.store
     }
 
     /// Subscribe to a singleton key-value pair.
@@ -147,9 +129,7 @@ impl<
     type ReadLock = std::sync::RwLockReadGuard<'store, Storage<TableStorage>>;
 
     fn read_lock(self) -> Self::ReadLock {
-        // SAFETY: safe since `self.store` must be live since `self` is (by it's field invariant),
-        // and the returned lock carries the `'store` lifetime.
-        unsafe { (*self.store).get_read_lock() }
+        self.store.get_read_lock()
     }
 }
 
@@ -186,32 +166,15 @@ pub struct Table<
     TableStorage: schema::GeneratedStorage + 'static,
     D: schema::TableDesc<Storage = TableStorage>,
 > {
-    /// Invariant: the store outlives `self`.
-    store: *const KvStore<TableStorage>,
+    store: Arc<KvStore<TableStorage>>,
     desc: PhantomData<D>,
-}
-
-// SAFETY: by the field invariant of `store`.
-unsafe impl<
-    TableStorage: schema::GeneratedStorage + 'static,
-    D: schema::TableDesc<Storage = TableStorage>,
-> Send for Table<TableStorage, D>
-{
-}
-// SAFETY: by the field invariant of `store` and because `KvStore` is `Sync`.
-unsafe impl<
-    TableStorage: schema::GeneratedStorage + 'static,
-    D: schema::TableDesc<Storage = TableStorage>,
-> Sync for Table<TableStorage, D>
-{
 }
 
 impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Storage = TableStorage>>
     Table<TableStorage, D>
 {
-    /// SAFETY: the caller must ensure that the target of `store` will outlive `self`.
     #[doc(hidden)]
-    pub unsafe fn new(store: *const KvStore<TableStorage>) -> Self {
+    pub fn new(store: Arc<KvStore<TableStorage>>) -> Self {
         Table {
             store,
             desc: PhantomData,
@@ -219,8 +182,7 @@ impl<TableStorage: schema::GeneratedStorage + 'static, D: schema::TableDesc<Stor
     }
 
     fn store(&self) -> &KvStore<TableStorage> {
-        // SAFETY: safe since `self.store` must be live since `self` is (by it's field invariant).
-        unsafe { &(*self.store) }
+        &self.store
     }
 
     /// The number of key/value pairs in the table.
@@ -432,9 +394,7 @@ impl<
     type ReadLock = std::sync::RwLockReadGuard<'store, Storage<TableStorage>>;
 
     fn read_lock(self) -> Self::ReadLock {
-        // SAFETY: safe since `self.store` must be live since `self` is (by it's field invariant),
-        // and the returned lock carries the `'store` lifetime.
-        unsafe { (*self.store).get_read_lock() }
+        self.store.get_read_lock()
     }
 }
 

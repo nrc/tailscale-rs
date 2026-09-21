@@ -2155,9 +2155,11 @@ mod tests {
         let mut txn = store.begin_transaction(OWNER);
         {
             let table = &mut txn.Items;
-            for (_, v) in table.iter_mut() {
-                v.push('!');
-            }
+            table.with_iter_mut(|i| {
+                for (_, v) in i {
+                    v.push('!');
+                }
+            });
         }
         txn.commit().unwrap();
 
@@ -2179,9 +2181,11 @@ mod tests {
         let mut txn = owned.begin_transaction();
         {
             let table = &mut txn.Items;
-            for (_, v) in table.iter_mut() {
-                v.push('!');
-            }
+            table.with_iter_mut(|i| {
+                for (_, v) in i {
+                    v.push('!');
+                }
+            });
         }
         txn.commit().unwrap();
 
@@ -2205,7 +2209,7 @@ mod tests {
         let mut txn = store.begin_transaction(OWNER);
         {
             let table = &mut txn.Items;
-            table.iter_mut().next().unwrap().1.push('!');
+            table.with_iter_mut(|i| i.next().unwrap().1.push('!'));
         }
         txn.commit().unwrap();
 
@@ -2235,10 +2239,12 @@ mod tests {
         {
             let table = &mut txn.Items;
             table.remove(&2);
-            // `iter_mut` skips the removed key, so key 2 is only reported as a removal.
-            for (_, v) in table.iter_mut() {
-                v.push('!');
-            }
+            // `with_iter_mut` skips the removed key, so key 2 is only reported as a removal.
+            table.with_iter_mut(|i| {
+                for (_, v) in i {
+                    v.push('!');
+                }
+            });
         }
         txn.commit().unwrap();
 
@@ -2262,7 +2268,7 @@ mod tests {
         let mut txn = store.begin_transaction(OWNER);
         {
             let table = &mut txn.Items;
-            assert_eq!(table.iter_mut().count(), 0);
+            assert_eq!(table.with_iter_mut(|i| i.count()), 0);
         }
         txn.commit().unwrap();
 
@@ -2898,7 +2904,7 @@ mod tests {
         {
             let t = &mut txn.Items;
             // Every row is visited (and so de-indexed and re-indexed), but none is changed.
-            assert_eq!(t.iter_mut().count(), 3);
+            assert_eq!(t.with_iter_mut(|i| i.count()), 3);
         }
         txn.commit().unwrap();
 
@@ -2919,11 +2925,13 @@ mod tests {
         let mut txn = owned.begin_transaction();
         {
             let t = &mut txn.Items;
-            for (k, v) in t.iter_mut() {
-                if *k == 2 {
-                    v.push('!');
+            t.with_iter_mut(|i| {
+                for (k, v) in i {
+                    if *k == 2 {
+                        v.push('!');
+                    }
                 }
-            }
+            });
         }
         txn.commit().unwrap();
 
@@ -2949,7 +2957,7 @@ mod tests {
         let mut txn = store.begin_transaction(OWNER);
         {
             let t = &mut txn.Items;
-            let total: usize = t.values_mut().map(|v| v.len()).sum();
+            let total: usize = t.with_iter_mut(|i| i.map(|(_, v)| v.len()).sum());
             assert_eq!(total, 4);
         }
         txn.commit().unwrap();
@@ -3179,7 +3187,7 @@ mod tests {
         rec.reset();
 
         // Iterating an index takes its mutable references via a different path (`Table::get_mut`)
-        // to the one `iter_mut` on a plain table uses.
+        // to the one `with_iter_mut` on a plain table uses.
         let visited = owned.Rows.indexes().name.with_iter_mut(|it| it.count());
         assert_eq!(visited, 2);
 

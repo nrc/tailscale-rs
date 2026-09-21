@@ -635,21 +635,16 @@ mod test {
     fn index_iter_empty_on_fresh_store() {
         let store = KvStore::new();
         let index = store.with_owner(OWNER).Users.indexes().name;
-        let items: Vec<_> = index.iter().collect();
-        assert!(items.is_empty());
+        assert_eq!(index.with_iter(|i| i.count()), 0);
     }
 
     #[test]
     fn index_iter_yields_index_key_and_base_value() {
         let store = KvStore::new();
         store.Users.insert(OWNER, 1, row("Alice"));
-        let items: Vec<_> = store
-            .Users
-            .indexes()
-            .name
-            .iter(OWNER)
-            .map(|(k, bk, v)| (k.clone(), *bk, v.clone()))
-            .collect();
+        let items: Vec<_> = store.Users.indexes().name.with_iter(OWNER, |i| {
+            i.map(|(k, bk, v)| (k.clone(), *bk, v.clone())).collect()
+        });
         assert_eq!(items, vec![("Alice".to_owned(), 1, row("Alice"))]);
     }
 
@@ -658,13 +653,9 @@ mod test {
         let store = KvStore::new();
         store.Users.insert(OWNER, 1, row("Alice"));
         store.Users.insert(OWNER, 2, row("Bob"));
-        let mut items: Vec<_> = store
-            .Users
-            .indexes()
-            .name
-            .iter(OWNER)
-            .map(|(k, bk, v)| (k.clone(), *bk, v.clone()))
-            .collect();
+        let mut items: Vec<_> = store.Users.indexes().name.with_iter(OWNER, |i| {
+            i.map(|(k, bk, v)| (k.clone(), *bk, v.clone())).collect()
+        });
         items.sort_by_key(|(k, ..)| k.clone());
         assert_eq!(
             items,
@@ -680,7 +671,7 @@ mod test {
         let store = KvStore::new();
         let table = store.with_owner(OWNER).Users.indexes().name;
 
-        let keys: Vec<_> = table.keys().collect();
+        let keys: Vec<String> = table.with_keys(|k| k.cloned().collect());
         assert!(keys.is_empty());
     }
 
@@ -691,7 +682,7 @@ mod test {
         store.Users.insert(OWNER, 2, row("Bob"));
 
         let table = store.with_owner(OWNER).Users.indexes().name;
-        let mut keys: Vec<_> = table.keys().collect();
+        let mut keys: Vec<String> = table.with_keys(|k| k.cloned().collect());
         keys.sort();
         assert_eq!(keys, vec!["Alice", "Bob"]);
     }
@@ -701,7 +692,7 @@ mod test {
         let store = KvStore::new();
         let index = store.with_owner(OWNER).Users.indexes().name;
         let mut count = 0;
-        index.iter().for_each(|_| count += 1);
+        index.with_iter(|i| i.for_each(|_| count += 1));
         assert_eq!(count, 0);
     }
 
@@ -711,9 +702,7 @@ mod test {
         store.Users.insert(OWNER, 1, row("Alice"));
         let index = store.with_owner(OWNER).Users.indexes().name;
         let mut items: Vec<_> = Vec::new();
-        index
-            .iter()
-            .for_each(|(k, bk, v)| items.push((k.clone(), *bk, v.clone())));
+        index.with_iter(|i| i.for_each(|(k, bk, v)| items.push((k.clone(), *bk, v.clone()))));
         assert_eq!(items, vec![("Alice".to_owned(), 1, row("Alice"))]);
     }
 
@@ -724,9 +713,7 @@ mod test {
         store.Users.insert(OWNER, 2, row("Bob"));
         let index = store.with_owner(OWNER).Users.indexes().name;
         let mut items: Vec<_> = Vec::new();
-        index
-            .iter()
-            .for_each(|(k, bk, v)| items.push((k.clone(), *bk, v.clone())));
+        index.with_iter(|i| i.for_each(|(k, bk, v)| items.push((k.clone(), *bk, v.clone()))));
         items.sort_by_key(|(k, ..)| k.clone());
         assert_eq!(
             items,
@@ -1142,21 +1129,20 @@ mod test_two_indexes {
     }
 
     #[test]
-    fn both_indexes_of_one_table_are_mutable_at_once_in_a_txn() {
+    fn mutation_through_one_index_is_visible_through_another_in_a_txn() {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OWNER);
         txn.People.insert(1, person("a@example.com", b"alice"));
 
-        let mut indexes = txn.People.indexes();
-        let email = &mut indexes.email;
-        let username = &mut indexes.username;
-
-        // A mutation made through one index is visible through the other while both are held.
-        email
+        // Each index mutably borrows the table, so they are used one at a time.
+        txn.People
+            .indexes()
+            .email()
             .with_mut("a@example.com", |_, v| {
                 v.username = b"bob".to_vec();
             })
             .unwrap();
+        let username = txn.People.indexes().username();
         assert!(username.get(b"alice".as_slice()).is_none());
         assert_eq!(
             username.get(b"bob".as_slice()).unwrap(),
@@ -1201,7 +1187,7 @@ mod test_transactional_index {
     fn txn_index_get_returns_none_when_absent() {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OWNER);
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
     }
 
     #[test]
@@ -1210,7 +1196,7 @@ mod test_transactional_index {
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
         assert_eq!(
-            txn.Users.indexes().name.get("Alice").unwrap(),
+            txn.Users.indexes().name().get("Alice").unwrap(),
             (1, row("Alice"))
         );
         txn.commit().unwrap();
@@ -1220,7 +1206,7 @@ mod test_transactional_index {
         );
 
         let mut txn = store.begin_transaction(OWNER);
-        txn.Users.indexes().name.remove("Alice");
+        txn.Users.indexes().name().remove("Alice");
         txn.commit().unwrap();
         assert!(store.Users.indexes().name.get(OWNER, "Alice").is_none());
     }
@@ -1233,7 +1219,7 @@ mod test_transactional_index {
         assert_eq!(
             txn.Users
                 .indexes()
-                .name
+                .name()
                 .with("Alice", |k, v| {
                     assert_eq!(*k, 1);
                     v.name.len()
@@ -1250,12 +1236,12 @@ mod test_transactional_index {
         txn.Users.insert(1, row("Alice"));
         txn.Users
             .indexes()
-            .name
+            .name()
             .with_mut("Alice", |_, v| v.name = "Bob".to_owned())
             .unwrap();
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
         assert_eq!(
-            txn.Users.indexes().name.get("Bob").unwrap(),
+            txn.Users.indexes().name().get("Bob").unwrap(),
             (
                 1,
                 Row {
@@ -1273,11 +1259,11 @@ mod test_transactional_index {
         txn.Users.insert(1, row("Alice"));
         txn.Users
             .indexes()
-            .name
+            .name()
             .with_mut("Alice", |_, v| v.age = 42)
             .unwrap();
         assert_eq!(
-            txn.Users.indexes().name.get("Alice").unwrap(),
+            txn.Users.indexes().name().get("Alice").unwrap(),
             (
                 1,
                 Row {
@@ -1293,8 +1279,8 @@ mod test_transactional_index {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
-        txn.Users.indexes().name.remove("Alice");
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+        txn.Users.indexes().name().remove("Alice");
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
     }
 
     #[test]
@@ -1302,7 +1288,7 @@ mod test_transactional_index {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
-        txn.Users.indexes().name.remove("Alice");
+        txn.Users.indexes().name().remove("Alice");
         assert!(txn.Users.get(&1).is_none());
         txn.commit().unwrap();
         assert!(store.Users.get(OWNER, &1).is_none());
@@ -1315,12 +1301,11 @@ mod test_transactional_index {
         txn.Users.insert(1, row("Alice"));
         txn.Users
             .indexes()
-            .name
-            .iter_mut()
-            .for_each(|(_, _, v)| v.name = "Charlie".to_owned());
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+            .name()
+            .with_iter_mut(|i| i.for_each(|(_, _, v)| v.name = "Charlie".to_owned()));
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
         assert_eq!(
-            txn.Users.indexes().name.get("Charlie").unwrap(),
+            txn.Users.indexes().name().get("Charlie").unwrap(),
             (
                 1,
                 Row {
@@ -1340,18 +1325,17 @@ mod test_transactional_index {
         txn.Users.insert(2, row("Bob"));
         txn.Users
             .indexes()
-            .name
-            .iter_mut()
-            .for_each(|(_, _, v)| v.name.push('!'));
+            .name()
+            .with_iter_mut(|i| i.for_each(|(_, _, v)| v.name.push('!')));
 
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
-        assert!(txn.Users.indexes().name.get("Bob").is_none());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
+        assert!(txn.Users.indexes().name().get("Bob").is_none());
         assert_eq!(
-            txn.Users.indexes().name.get("Alice!").unwrap(),
+            txn.Users.indexes().name().get("Alice!").unwrap(),
             (1, row("Alice!"))
         );
         assert_eq!(
-            txn.Users.indexes().name.get("Bob!").unwrap(),
+            txn.Users.indexes().name().get("Bob!").unwrap(),
             (2, row("Bob!"))
         );
     }
@@ -1363,23 +1347,21 @@ mod test_transactional_index {
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
         txn.Users.insert(2, row("Bob"));
-        txn.Users
-            .indexes()
-            .name
-            .iter_mut()
-            .for_each(|(_, base_key, v)| {
+        txn.Users.indexes().name().with_iter_mut(|i| {
+            i.for_each(|(_, base_key, v)| {
                 if *base_key == 1 {
                     v.name = "Zara".to_owned();
                 }
-            });
+            })
+        });
 
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
         assert_eq!(
-            txn.Users.indexes().name.get("Zara").unwrap(),
+            txn.Users.indexes().name().get("Zara").unwrap(),
             (1, row("Zara"))
         );
         assert_eq!(
-            txn.Users.indexes().name.get("Bob").unwrap(),
+            txn.Users.indexes().name().get("Bob").unwrap(),
             (2, row("Bob"))
         );
     }
@@ -1390,7 +1372,7 @@ mod test_transactional_index {
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
         assert_eq!(
-            txn.Users.indexes().name.get("Alice").unwrap(),
+            txn.Users.indexes().name().get("Alice").unwrap(),
             (1, row("Alice"))
         );
     }
@@ -1401,9 +1383,9 @@ mod test_transactional_index {
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
         txn.Users.with_mut(&1, |v| v.name = "Bob".to_owned());
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
         assert_eq!(
-            txn.Users.indexes().name.get("Bob").unwrap(),
+            txn.Users.indexes().name().get("Bob").unwrap(),
             (
                 1,
                 Row {
@@ -1420,7 +1402,7 @@ mod test_transactional_index {
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
         txn.Users.remove(&1);
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
     }
 
     #[test]
@@ -1430,8 +1412,8 @@ mod test_transactional_index {
         txn.Users.insert(1, row("Alice"));
         txn.Users.insert(2, row("Bob"));
         txn.Users.clear();
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
-        assert!(txn.Users.indexes().name.get("Bob").is_none());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
+        assert!(txn.Users.indexes().name().get("Bob").is_none());
     }
 
     #[test]
@@ -1439,10 +1421,11 @@ mod test_transactional_index {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.insert(1, row("Alice"));
-        txn.Users.iter_mut().next().unwrap().1.name = "Charlie".to_owned();
-        assert!(txn.Users.indexes().name.get("Alice").is_none());
+        txn.Users
+            .with_iter_mut(|i| i.next().unwrap().1.name = "Charlie".to_owned());
+        assert!(txn.Users.indexes().name().get("Alice").is_none());
         assert_eq!(
-            txn.Users.indexes().name.get("Charlie").unwrap(),
+            txn.Users.indexes().name().get("Charlie").unwrap(),
             (
                 1,
                 Row {
@@ -1463,9 +1446,11 @@ mod test_transactional_index {
         txn.Users.insert(1, row("Alice"));
         txn.Users.clear();
         txn.Users.insert(2, row("Bob"));
-        for (_, v) in txn.Users.iter_mut() {
-            v.name.push('!');
-        }
+        txn.Users.with_iter_mut(|i| {
+            for (_, v) in i {
+                v.name.push('!');
+            }
+        });
         txn.commit().unwrap();
 
         let index = store.with_owner(OWNER).Users.indexes().name;
@@ -1480,7 +1465,7 @@ mod test_transactional_index {
         let mut txn = store.begin_transaction(OWNER);
         txn.Users.clear();
         txn.Users.insert(2, row("Bob"));
-        for (_, _v) in txn.Users.iter_mut() {}
+        txn.Users.with_iter_mut(|i| for (_, _v) in i {});
         txn.commit().unwrap();
 
         let index = store.with_owner(OWNER).Users.indexes().name;
@@ -1496,9 +1481,11 @@ mod test_transactional_index {
         txn.Users.insert(1, row("Alice"));
         txn.Users.insert(2, row("Bob"));
         txn.Users.remove(&1);
-        for (_, v) in txn.Users.iter_mut() {
-            v.name.push('!');
-        }
+        txn.Users.with_iter_mut(|i| {
+            for (_, v) in i {
+                v.name.push('!');
+            }
+        });
         txn.commit().unwrap();
 
         let index = store.with_owner(OWNER).Users.indexes().name;
@@ -1584,7 +1571,7 @@ mod test_transactional_index {
     fn txn_index_remove_wrong_owner_panics() {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OTHER);
-        txn.Users.indexes().name.remove("Alice");
+        txn.Users.indexes().name().remove("Alice");
     }
 
     #[test]
@@ -1592,8 +1579,8 @@ mod test_transactional_index {
     fn txn_index_iter_mut_wrong_owner_panics() {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OTHER);
-        let mut table = txn.Users.indexes().name;
-        let _iter = table.iter_mut();
+        let mut table = txn.Users.indexes().name();
+        table.with_iter_mut(|_| {});
     }
 
     #[test]
@@ -1604,7 +1591,7 @@ mod test_transactional_index {
             let mut txn = store.begin_transaction(OWNER);
             txn.Users
                 .indexes()
-                .name
+                .name()
                 .with_mut("Alice", |_, v| v.name = "Bob".to_owned())
                 .unwrap();
         }
@@ -1622,7 +1609,7 @@ mod test_transactional_index {
         store.Users.insert(OWNER, 1, row("Alice"));
         {
             let mut txn = store.begin_transaction(OWNER);
-            txn.Users.indexes().name.remove("Alice");
+            txn.Users.indexes().name().remove("Alice");
         }
         assert_eq!(
             store.Users.indexes().name.get(OWNER, "Alice").unwrap(),
@@ -1686,7 +1673,7 @@ mod test_poison {
         txn.Users.insert(1, row("Alice", "alice1@x.com"));
         txn.Users.insert(2, row("Alice", "alice2@x.com"));
 
-        let mut index_name = txn.Users.indexes().name;
+        let mut index_name = txn.Users.indexes().name();
         assert_eq!(
             index_name.check_consistent(),
             Err(Error::NonUniqueIndexKey("Users by name"))
@@ -1731,11 +1718,11 @@ mod test_poison {
 
         // `name` is poisoned (both "Alice")...
         assert!(matches!(
-            txn.Users.indexes().name.check_consistent(),
+            txn.Users.indexes().name().check_consistent(),
             Err(Error::NonUniqueIndexKey(_))
         ));
         // ...but `email` has distinct keys and stays consistent.
-        let email_index = txn.Users.indexes().email;
+        let email_index = txn.Users.indexes().email();
         assert!(email_index.check_consistent().is_ok());
         assert_eq!(
             email_index.get("alice1@x.com").unwrap(),
@@ -1754,10 +1741,10 @@ mod test_poison {
         txn.Users.insert(1, row("Alice", "alice1@x.com"));
         txn.Users.insert(2, row("Alice", "alice2@x.com"));
 
-        assert!(txn.Users.indexes().name.check_consistent().is_err());
+        assert!(txn.Users.indexes().name().check_consistent().is_err());
 
         txn.Users.clear();
-        let index = txn.Users.indexes().name;
+        let index = txn.Users.indexes().name();
         assert!(index.check_consistent().is_ok());
         assert!(index.get("Alice").is_none());
     }
@@ -1770,7 +1757,7 @@ mod test_poison {
         txn.Users.insert(2, row("Alice", "alice2@x.com"));
 
         assert!(matches!(
-            txn.Users.indexes().name.get("Alice"),
+            txn.Users.indexes().name().get("Alice"),
             Err(Error::NonUniqueIndexKey(_))
         ));
     }
@@ -1783,7 +1770,7 @@ mod test_poison {
         txn.Users.insert(2, row("Alice", "alice2@x.com"));
 
         assert!(matches!(
-            txn.Users.indexes().name.check_consistent(),
+            txn.Users.indexes().name().check_consistent(),
             Err(Error::NonUniqueIndexKey(_))
         ));
     }

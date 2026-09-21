@@ -1086,8 +1086,7 @@ mod test {
     fn table_iter_empty_on_fresh_store() {
         let store = KvStore::new();
         let table = &store.Items;
-        let items: Vec<_> = table.iter(OWNER).collect();
-        assert!(items.is_empty());
+        assert_eq!(table.with_iter(OWNER, |i| i.count()), 0);
     }
 
     #[test]
@@ -1096,11 +1095,12 @@ mod test {
         let table = &store.Items;
         table.insert(OWNER, "a", "alpha".to_owned());
         table.insert(OWNER, "b", "beta".to_owned());
-        let mut items: Vec<_> = table.iter(OWNER).collect();
+        let mut items: Vec<_> =
+            table.with_iter(OWNER, |i| i.map(|(k, v)| (*k, v.clone())).collect());
         items.sort();
         assert_eq!(
             items,
-            vec![(&"a", &"alpha".to_owned()), (&"b", &"beta".to_owned())]
+            vec![("a", "alpha".to_owned()), ("b", "beta".to_owned())]
         );
     }
 
@@ -1115,8 +1115,8 @@ mod test {
                 v.push_str("v2");
             })
             .unwrap();
-        let items: Vec<_> = table.iter(OWNER).collect();
-        assert_eq!(items, vec![(&"k", &"v2".to_owned())]);
+        let items: Vec<_> = table.with_iter(OWNER, |i| i.map(|(k, v)| (*k, v.clone())).collect());
+        assert_eq!(items, vec![("k", "v2".to_owned())]);
     }
 
     #[test]
@@ -1124,7 +1124,7 @@ mod test {
         let store = KvStore::new();
         let table = &store.Items;
         let mut count = 0;
-        table.iter(OWNER).for_each(|_| count += 1);
+        table.with_iter(OWNER, |i| i.for_each(|_| count += 1));
         assert_eq!(count, 0);
     }
 
@@ -1135,9 +1135,7 @@ mod test {
         table.insert(OWNER, "a", "alpha".to_owned());
         table.insert(OWNER, "b", "beta".to_owned());
         let mut items: Vec<_> = Vec::new();
-        table
-            .iter(OWNER)
-            .for_each(|(k, v)| items.push((*k, v.clone())));
+        table.with_iter(OWNER, |i| i.for_each(|(k, v)| items.push((*k, v.clone()))));
         items.sort();
         assert_eq!(
             items,
@@ -1183,8 +1181,7 @@ mod test {
     fn table_iter_keys_cloned_empty() {
         let store = KvStore::new();
         let table = &store.Items;
-        let keys: Vec<_> = table.keys(OWNER).collect();
-        assert!(keys.is_empty());
+        assert_eq!(table.with_keys(OWNER, |k| k.count()), 0);
     }
 
     #[test]
@@ -1193,7 +1190,7 @@ mod test {
         let table = &store.Items;
         table.insert(OWNER, "a", "alpha".to_owned());
         table.insert(OWNER, "b", "beta".to_owned());
-        let mut keys: Vec<_> = table.keys(OWNER).copied().collect();
+        let mut keys: Vec<_> = table.with_keys(OWNER, |k| k.copied().collect());
         keys.sort();
         assert_eq!(keys, vec!["a", "b"]);
     }
@@ -1202,8 +1199,7 @@ mod test {
     fn table_iter_values_cloned_empty() {
         let store = KvStore::new();
         let table = &store.Items;
-        let values: Vec<_> = table.values(OWNER).collect();
-        assert!(values.is_empty());
+        assert_eq!(table.with_values(OWNER, |v| v.count()), 0);
     }
 
     #[test]
@@ -1212,7 +1208,7 @@ mod test {
         let table = &store.Items;
         table.insert(OWNER, "a", "alpha".to_owned());
         table.insert(OWNER, "b", "beta".to_owned());
-        let mut values: Vec<_> = table.values(OWNER).collect();
+        let mut values: Vec<_> = table.with_values(OWNER, |v| v.cloned().collect());
         values.sort();
         assert_eq!(values, vec!["alpha", "beta"]);
     }
@@ -1284,11 +1280,11 @@ mod test {
         owned.Items.with_mut(&"a", |v| v.push('!')).unwrap();
         assert_eq!(owned.Items.get("a"), Some("alpha!".to_owned()));
 
-        let mut keys: Vec<_> = owned.Items.keys().copied().collect();
+        let mut keys: Vec<_> = owned.Items.with_keys(|k| k.copied().collect());
         keys.sort();
         assert_eq!(keys, vec!["a", "b"]);
-        assert_eq!(owned.Items.iter().count(), 2);
-        assert_eq!(owned.Items.values().count(), 2);
+        assert_eq!(owned.Items.with_iter(|i| i.count()), 2);
+        assert_eq!(owned.Items.with_values(|v| v.count()), 2);
 
         owned.Items.with_iter_mut(|i| {
             for (_, v) in i {

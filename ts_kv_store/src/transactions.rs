@@ -1119,7 +1119,7 @@ mod test {
         let mut txn = store.begin_transaction(OWNER);
         let table = &mut txn.Items;
         table.insert("k", "hello".to_owned());
-        table.iter_mut().next().unwrap().1.push('!');
+        table.with_iter_mut(|i| i.next().unwrap().1.push('!'));
         assert_eq!(table.get("k"), Some("hello!".to_owned()));
     }
 
@@ -1128,8 +1128,8 @@ mod test {
         let store = KvStore::new();
         let mut txn = store.begin_transaction(OWNER);
         let table = &mut txn.Items;
-        assert!(table.iter_mut().next().is_none());
-        assert_eq!(table.iter_mut().count(), 0);
+        assert!(table.with_iter_mut(|i| i.next().is_none()));
+        assert_eq!(table.with_iter_mut(|i| i.count()), 0);
     }
 
     #[test]
@@ -1140,15 +1140,17 @@ mod test {
         table.insert("a", "x".to_owned());
         table.insert("b", "y".to_owned());
         table.insert("c", "z".to_owned());
-        for (_, v) in table.iter_mut() {
-            v.push('!');
-        }
+        table.with_iter_mut(|i| {
+            for (_, v) in i {
+                v.push('!');
+            }
+        });
         assert_eq!(table.get("a"), Some("x!".to_owned()));
         assert_eq!(table.get("b"), Some("y!".to_owned()));
         assert_eq!(table.get("c"), Some("z!".to_owned()));
     }
 
-    // `iter_mut` must respect a `DeleteMask::Some` produced by removing a key earlier in the
+    // `with_iter_mut` must respect a `DeleteMask::Some` produced by removing a key earlier in the
     // same transaction: the removed key should not be visited.
     #[test]
     fn txn_table_iter_mut_skips_removed_key() {
@@ -1160,20 +1162,22 @@ mod test {
         table.insert("c", "z".to_owned());
         table.remove(&"b");
 
-        let mut keys: Vec<_> = table.iter_mut().map(|(k, _)| *k).collect();
+        let mut keys: Vec<_> = table.with_iter_mut(|i| i.map(|(k, _)| *k).collect());
         keys.sort();
         assert_eq!(keys, vec!["a", "c"]);
 
         // Mutations through the iterator still land, and the removed key stays gone.
-        for (_, v) in table.iter_mut() {
-            v.push('!');
-        }
+        table.with_iter_mut(|i| {
+            for (_, v) in i {
+                v.push('!');
+            }
+        });
         assert_eq!(table.get("a"), Some("x!".to_owned()));
         assert!(table.get("b").is_none());
         assert_eq!(table.get("c"), Some("z!".to_owned()));
     }
 
-    // `iter_mut` must respect a `DeleteMask::All` produced by clearing the table earlier in the
+    // `with_iter_mut` must respect a `DeleteMask::All` produced by clearing the table earlier in the
     // same transaction: only rows inserted after the clear should be visited.
     #[test]
     fn txn_table_iter_mut_after_clear_visits_only_new_rows() {
@@ -1186,15 +1190,15 @@ mod test {
         table.clear();
         table.insert("c", "z".to_owned());
 
-        let mut visited: Vec<_> = table.iter_mut().map(|(k, _)| *k).collect();
+        let mut visited: Vec<_> = table.with_iter_mut(|i| i.map(|(k, _)| *k).collect());
         visited.sort();
         assert_eq!(visited, vec!["c"]);
 
-        table.iter_mut().next().unwrap().1.push('!');
+        table.with_iter_mut(|i| i.next().unwrap().1.push('!'));
         assert_eq!(table.get("c"), Some("z!".to_owned()));
     }
 
-    // Rolling back a transaction that mutated values via `iter_mut` must leave the committed
+    // Rolling back a transaction that mutated values via `with_iter_mut` must leave the committed
     // state untouched. This exercises the "all keys modified" (`keys == None`) GC path.
     #[test]
     fn txn_iter_mut_rollback_discards_changes() {
@@ -1203,9 +1207,11 @@ mod test {
         store.Items.insert(OWNER, "b", "y".to_owned());
 
         let mut txn = store.begin_transaction(OWNER);
-        for (_, v) in txn.Items.iter_mut() {
-            v.push('!');
-        }
+        txn.Items.with_iter_mut(|i| {
+            for (_, v) in i {
+                v.push('!');
+            }
+        });
         txn.rollback();
 
         assert_eq!(store.Items.get(OWNER, "a"), Some("x".to_owned()));
@@ -1213,7 +1219,9 @@ mod test {
 
         // The store is still usable and a fresh transaction sees the original values.
         let mut txn = store.begin_transaction(OWNER);
-        let mut visited: Vec<_> = txn.Items.iter_mut().map(|(k, v)| (*k, v.clone())).collect();
+        let mut visited: Vec<_> = txn
+            .Items
+            .with_iter_mut(|i| i.map(|(k, v)| (*k, v.clone())).collect());
         visited.sort();
         assert_eq!(visited, vec![("a", "x".to_owned()), ("b", "y".to_owned())]);
     }
@@ -1259,7 +1267,7 @@ mod test {
 
         {
             let mut txn = store.begin_transaction(OWNER);
-            assert_eq!(txn.Items.iter_mut().count(), 1);
+            assert_eq!(txn.Items.with_iter_mut(|i| i.count()), 1);
         }
         assert_eq!(store.Items.get(OWNER, "k"), Some("a".to_owned()));
 
@@ -2159,12 +2167,16 @@ mod test {
         store.Items.insert(OWNER, "b", "y".to_owned());
 
         let mut txn = store.begin_transaction(OWNER);
-        for (_, v) in txn.Items.iter_mut() {
-            v.push('!');
-        }
-        for v in txn.Items.values_mut() {
-            v.push('!');
-        }
+        txn.Items.with_iter_mut(|i| {
+            for (_, v) in i {
+                v.push('!');
+            }
+        });
+        txn.Items.with_iter_mut(|i| {
+            for v in i.map(|(_, v)| v) {
+                v.push('!');
+            }
+        });
         txn.commit().unwrap();
 
         assert_eq!(store.Items.get(OWNER, "a"), Some("x!!".to_owned()));

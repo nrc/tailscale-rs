@@ -198,7 +198,7 @@ pub use pub_sub::{
 };
 #[doc(inline)]
 pub use raw::{Singleton, SingletonWithOwner, Table, TableWithOwner};
-pub use schema::GeneratedStorage;
+pub use schema::{GeneratedStorage, GeneratedStore};
 #[doc(inline)]
 pub use transactions::{
     RoSingletonTransaction, RoTableTransaction, RoTransaction, SingletonTransaction,
@@ -242,10 +242,10 @@ impl<TableStorage: schema::GeneratedStorage> KvStore<TableStorage> {
     /// subscriptions is harmless but pointless.
     ///
     /// Does nothing if the subscriber is unknown (e.g., because it has already been removed).
-    pub fn remove_subscriber(&self, subscriber: Subscriber) {
+    pub fn remove_subscriber(&self, subscriber: impl Into<crate::Subscriber>) {
         self.get_read_lock()
             .subscriptions
-            .remove_subscriber(subscriber)
+            .remove_subscriber(subscriber.into())
     }
 
     /// Subscribe to the whole store.

@@ -5,12 +5,20 @@
 //!
 //! A KV store is declared in the usual way using the `schema` macros. An instance of the store is
 //! created as part of creating a [`TokioNotifier`]. The notifier can be used to access the store
-//! (using the [`TokioNotifier::store`] method). Users should use the subscribe/unsubscribe methods
-//! of the notifier, rather than the underlying store.
+//! (using the [`TokioNotifier::store`] method).
 //!
 //! A [`TokioSubscriber`] is created from a [`TokioNotifier`] and combines a subscriber identity
 //! with the receiving end of a channel for receiving notifications (all subscriptions for a single
 //! subscriber are sent via the same channel).
+//!
+//! When subscribing to data in a store, a [`TokioSubscriber`] can be used directly as the subscriber,
+//! e.g.,
+//! 
+//! ```ignore
+//! let notifier = TokioNotifier::new();
+//! let subscriber = notifier.create_subscriber(OWNER);
+//! notifier.store().foo.subscribe(&subscriber);
+//! ```
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -26,8 +34,7 @@ use tokio::{
     task::JoinHandle,
 };
 use ts_kv_store::{
-    GeneratedStorage, KvStore, Notifications, Notifier, Owner, Subscriber, Subscription,
-    schema::{SingletonDesc, TableDesc},
+    GeneratedStorage, GeneratedStore, Notifications, Notifier, Owner, Subscriber, Subscription,
 };
 
 mod notify;
@@ -41,8 +48,8 @@ const CHANNEL_CAPACITY: usize = 2;
 /// A [`Notifier`] which forwards notifications to subscribers using Tokio channels.
 ///
 /// The generic parameter `Storage` links a notifier instance to a specific store.
-pub struct TokioNotifier<Storage: GeneratedStorage> {
-    store: Arc<KvStore<Storage>>,
+pub struct TokioNotifier<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> {
+    store: Arc<Store>,
     senders: Mutex<HashMap<Subscriber, SubscriberSender<Storage>>>,
     /// Notifications waiting to be sent, oldest first.
     queue: Mutex<VecDeque<QueuedNotifications<Storage>>>,
@@ -58,7 +65,7 @@ pub struct TokioNotifier<Storage: GeneratedStorage> {
 type QueuedNotifications<Storage> =
     HashMap<Subscription, Vec<<Storage as GeneratedStorage>::Notification>>;
 
-impl<Storage: GeneratedStorage + 'static> TokioNotifier<Storage> {
+impl<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> TokioNotifier<Storage, Store> {
     /// Create a new `TokioNotifier` and [`KvStore`]. Spawns a task to send notifcations.
     ///
     /// The notifier owns the store and the store holds a weak reference back to the notifier.
@@ -66,14 +73,16 @@ impl<Storage: GeneratedStorage + 'static> TokioNotifier<Storage> {
     /// Spawns the task which sends notifications to subscribers, so this must be called from within
     /// a Tokio runtime. The task runs until the notifier is dropped, waking whenever there are
     /// notifications to send and periodically while any are waiting to be retried.
-    pub fn new() -> Arc<TokioNotifier<Storage>> {
+    pub fn new() -> Arc<TokioNotifier<Storage, Store>> {
         let notify = Arc::new(Notify::new());
 
-        Arc::new_cyclic(|weak: &Weak<TokioNotifier<Storage>>| {
+        Arc::new_cyclic(|weak: &Weak<TokioNotifier<Storage, Store>>| {
             let task = tokio::spawn(notify::notify_loop(weak.clone(), notify.clone()));
 
             TokioNotifier {
-                store: Arc::new(KvStore::from_notifier(weak.clone())),
+                store: Arc::new(
+                    (weak.clone() as std::sync::Weak<dyn Notifier<Notification = _>>).into(),
+                ),
                 senders: Default::default(),
                 queue: Default::default(),
                 notify,
@@ -83,12 +92,12 @@ impl<Storage: GeneratedStorage + 'static> TokioNotifier<Storage> {
     }
 
     /// The [`KvStore`] this notifier was created for.
-    pub fn store(&self) -> &Arc<KvStore<Storage>> {
+    pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
 
     /// Create a new subscriber to this notifier.
-    pub fn create_subscriber(self: &Arc<Self>, owner: Owner) -> TokioSubscriber<Storage> {
+    pub fn create_subscriber(self: &Arc<Self>, owner: Owner) -> TokioSubscriber<Storage, Store> {
         let id = self.store.register_subscriber(owner);
         let (sender, receiver) = channel(CHANNEL_CAPACITY);
 
@@ -101,7 +110,6 @@ impl<Storage: GeneratedStorage + 'static> TokioNotifier<Storage> {
             id,
             receiver,
             notifier: self.clone(),
-            owner,
         }
     }
 
@@ -111,13 +119,17 @@ impl<Storage: GeneratedStorage + 'static> TokioNotifier<Storage> {
     }
 }
 
-impl<Storage: GeneratedStorage> fmt::Debug for TokioNotifier<Storage> {
+impl<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> fmt::Debug
+    for TokioNotifier<Storage, Store>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("TokioNotifier").finish()
     }
 }
 
-impl<Storage: GeneratedStorage + 'static> Notifier for TokioNotifier<Storage> {
+impl<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> Notifier
+    for TokioNotifier<Storage, Store>
+{
     type Notification = Storage::Notification;
 
     fn notify(&self, notifications: Notifications<Self::Notification>) {
@@ -126,7 +138,9 @@ impl<Storage: GeneratedStorage + 'static> Notifier for TokioNotifier<Storage> {
     }
 }
 
-impl<Storage: GeneratedStorage> Drop for TokioNotifier<Storage> {
+impl<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> Drop
+    for TokioNotifier<Storage, Store>
+{
     fn drop(&mut self) {
         // Stop the sending task. Without this, the task would wait forever.
         self.task.abort();
@@ -137,17 +151,24 @@ impl<Storage: GeneratedStorage> Drop for TokioNotifier<Storage> {
 /// and receives notifications.
 ///
 /// Dropping a subscriber removes it and all its subscriptions from the store.
-pub struct TokioSubscriber<Storage: GeneratedStorage + 'static> {
+pub struct TokioSubscriber<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> {
     /// KvStore's id for this subscriber.
     id: Subscriber,
     /// Reference to our 'parent' notifier.
-    notifier: Arc<TokioNotifier<Storage>>,
+    notifier: Arc<TokioNotifier<Storage, Store>>,
     /// Receiver end of a Tokio channel for receiving notifications from the notifier.
     receiver: Receiver<Storage::Notification>,
-    owner: Owner,
 }
 
-impl<Storage: GeneratedStorage + 'static> TokioSubscriber<Storage> {
+impl<Storage: GeneratedStorage, Store: GeneratedStore<Storage>>
+    From<&'_ TokioSubscriber<Storage, Store>> for Subscriber
+{
+    fn from(s: &'_ TokioSubscriber<Storage, Store>) -> Self {
+        s.id
+    }
+}
+
+impl<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> TokioSubscriber<Storage, Store> {
     /// Wait for the next notification.
     ///
     /// Returns [`Error::ChannelDisconnected`] if the channel is closed. No further notifications will
@@ -166,107 +187,11 @@ impl<Storage: GeneratedStorage + 'static> TokioSubscriber<Storage> {
             TryRecvError::Disconnected => Error::ChannelDisconnected,
         })
     }
-
-    /// Subscribe to the whole store.
-    ///
-    /// Returns [`Error::UnknownSubscriber`] if this subscriber is no longer known to the store. That
-    /// will happen if the notifier cannot send notifications to this subscriber.
-    pub fn subscribe_global(&self) -> Result<Subscription> {
-        Ok(self.notifier.store.subscribe_global(self.id)?)
-    }
-
-    /// Subscribe to the singleton key/value pair `S`.
-    ///
-    /// Returns [`Error::UnknownSubscriber`] if this subscriber is no longer known to the store. That
-    /// will happen if the notifier cannot send notifications to this subscriber.
-    pub fn subscribe_singleton<S: SingletonDesc<Storage = Storage>>(&self) -> Result<Subscription> {
-        Ok(self.notifier.store.subscribe::<S>(self.id)?)
-    }
-
-    /// Subscribe to the singleton key/value pair `S` and be sent its current value (if any).
-    ///
-    /// Returns [`Error::UnknownSubscriber`] if this subscriber is no longer known to the store. That
-    /// will happen if the notifier cannot send notifications to this subscriber.
-    pub fn subscribe_singleton_and_notify<S: SingletonDesc<Storage = Storage>>(
-        &self,
-    ) -> Result<Subscription> {
-        Ok(self.notifier.store.subscribe_and_notify::<S>(self.id)?)
-    }
-
-    /// Subscribe to every key in the table `D`.
-    ///
-    /// Returns [`Error::UnknownSubscriber`] if this subscriber is no longer known to the store. That
-    /// will happen if the notifier cannot send notifications to this subscriber.
-    pub fn subscribe_table<D: TableDesc<Storage = Storage>>(&self) -> Result<Subscription>
-    where
-        D::Key: Send,
-    {
-        Ok(self
-            .notifier
-            .store
-            .table::<D>(self.owner)
-            .subscribe(self.id)?)
-    }
-
-    /// Subscribe to a single `key` in the table `D`.
-    ///
-    /// Returns [`Error::UnknownSubscriber`] if this subscriber is no longer known to the store. That
-    /// will happen if the notifier cannot send notifications to this subscriber.
-    pub fn subscribe_key<D: TableDesc<Storage = Storage>>(
-        &self,
-        key: D::Key,
-    ) -> Result<Subscription>
-    where
-        D::Key: Send,
-    {
-        Ok(self
-            .notifier
-            .store
-            .table::<D>(self.owner)
-            .subscribe_key(self.id, key)?)
-    }
-
-    /// Subscribe to a single `key` in the table `D` and be sent its current value (if any).
-    ///
-    /// Returns [`Error::UnknownSubscriber`] if this subscriber is no longer known to the store. That
-    /// will happen if the notifier cannot send notifications to this subscriber.
-    pub fn subscribe_key_and_notify<D: TableDesc<Storage = Storage>>(
-        &self,
-        key: D::Key,
-    ) -> Result<Subscription>
-    where
-        D::Key: Send,
-    {
-        Ok(self
-            .notifier
-            .store
-            .table::<D>(self.owner)
-            .subscribe_key_and_notify(self.id, key)?)
-    }
-
-    /// Remove a subscription to the whole store.
-    pub fn unsubscribe_global(&self, subscription: Subscription) {
-        self.notifier.store.unsubscribe_global(subscription);
-    }
-
-    /// Remove a subscription to the singleton key/value pair `S`.
-    pub fn unsubscribe_singleton<S: SingletonDesc<Storage = Storage>>(
-        &self,
-        subscription: Subscription,
-    ) {
-        self.notifier.store.unsubscribe::<S>(subscription);
-    }
-
-    /// Remove a subscription to the table `D`.
-    pub fn unsubscribe_table<D: TableDesc<Storage = Storage>>(&self, subscription: Subscription) {
-        self.notifier
-            .store
-            .table::<D>(self.owner)
-            .unsubscribe(subscription);
-    }
 }
 
-impl<Storage: GeneratedStorage + 'static> Drop for TokioSubscriber<Storage> {
+impl<Storage: GeneratedStorage, Store: GeneratedStore<Storage>> Drop
+    for TokioSubscriber<Storage, Store>
+{
     /// Remove the subscriber (and thus all its subscriptions) from the store, drop the notifier's
     /// sender for it, and close its channel.
     fn drop(&mut self) {

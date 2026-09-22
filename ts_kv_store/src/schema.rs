@@ -74,7 +74,7 @@ pub trait TableDesc: Sized + 'static {
 ///
 /// SAFETY: A and B must represent distinct tables.
 #[allow(clippy::type_complexity)]
-pub(crate) fn get_two_tables_mut<
+pub(crate) unsafe fn get_two_tables_mut<
     Storage: GeneratedStorage,
     A: TableDesc<Storage = Storage> + Any,
     B: TableDesc<Storage = Storage> + Any,
@@ -109,7 +109,9 @@ pub trait Notifiable: TableDesc {
 }
 
 /// Describes a table used as an index.
-pub trait IndexDesc: TableDesc {
+///
+/// SAFETY: The base table of an index must be distinct from the index table.
+pub unsafe trait IndexDesc: TableDesc {
     /// The table which is indexed.
     type BaseTable: Notifiable + TableDesc<Storage = Self::Storage, Key = Self::Value>;
 }
@@ -374,7 +376,8 @@ macro_rules! store {
                     $crate::value_eq!(Self::Value);
                 }
 
-                impl $crate::schema::IndexDesc for index::$name::$field {
+                // SAFETY: the base and index tables are distinct by construction.
+                unsafe impl $crate::schema::IndexDesc for index::$name::$field {
                     type BaseTable = $name;
                 }
             )*

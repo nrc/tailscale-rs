@@ -462,7 +462,8 @@ pub(crate) trait TabularOpsMut<TableStorage: schema::GeneratedStorage>:
     }
 }
 
-pub(crate) trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
+/// SAFETY: The base table of an index must be distinct from the index table.
+pub(crate) unsafe trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
     OpsMut<TableStorage>
 {
     type IndexDesc: IndexDesc<Storage = TableStorage>;
@@ -484,9 +485,12 @@ pub(crate) trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
         let storage = storage.storage();
         let txn_id = storage.txn_id();
         let max_committed_id = storage.max_committed_id();
-        let (base, index) = schema::get_two_tables_mut::<_, Base<Self::IndexDesc>, Self::IndexDesc>(
-            &mut storage.tables,
-        );
+        // SAFETY: safe by the trait's safety invariant.
+        let (base, index) = unsafe {
+            schema::get_two_tables_mut::<_, Base<Self::IndexDesc>, Self::IndexDesc>(
+                &mut storage.tables,
+            )
+        };
         if index.is_poisoned(txn_id) {
             return Err(Error::NonUniqueIndexKey(
                 <Self::IndexDesc as TableDesc>::NAME,
@@ -510,9 +514,12 @@ pub(crate) trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
         let txn_id = storage.txn_id();
         let max_committed_id = storage.max_committed_id();
 
-        let (base, index) = schema::get_two_tables_mut::<_, Base<Self::IndexDesc>, Self::IndexDesc>(
-            &mut storage.tables,
-        );
+        // SAFETY:
+        let (base, index) = unsafe {
+            schema::get_two_tables_mut::<_, Base<Self::IndexDesc>, Self::IndexDesc>(
+                &mut storage.tables,
+            )
+        };
         base.assert_owner(owner);
 
         let Some(base_key) = index.get(key, txn_id) else {

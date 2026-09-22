@@ -187,7 +187,8 @@ impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage>
     type IndexDesc = D;
 }
 
-impl<'guard, 'txn, D: IndexDesc> IndexedOpsMut<D::Storage>
+// SAFETY: by the safety invariant of `IndexDesc`.
+unsafe impl<'guard, 'txn, D: IndexDesc> IndexedOpsMut<D::Storage>
     for &mut KvTableTransactionalIndex<'guard, 'txn, D>
 {
     type IndexDesc = D;

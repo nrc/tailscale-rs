@@ -85,9 +85,9 @@
 //!
 //! # Async access
 //!
-//! ts-kvstore has a synchronous API and no async functions. It is safe to use it in an async, as
-//! long as there are **no `await` points inside a transaction** (which can lead to degraded
-//! performance or deadlock).
+//! ts-kvstore has a synchronous API and no async functions. It is safe to use it in an async context, as
+//! long as **a transaction or iterator is never live across an `await` point** (which can lead to degraded
+//! performance or deadlock). Transactions are `!Send` and `!Sync` to help prevent this.
 //!
 //! A global lock is used internally and is held for the duration of a transaction. This is a `std`
 //! `RwLock` and so waiting for it will block the waiting thread (not just the async task). This is

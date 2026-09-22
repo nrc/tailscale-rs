@@ -158,6 +158,7 @@ where
     D::Value: PartialEq,
 {
     fn drop(&mut self) {
+        self.inner = None;
         let storage = self.guard.storage();
         let txn_id = storage.txn_id();
         let max_transaction_id = storage.max_committed_id();
@@ -340,6 +341,7 @@ impl<'guard, Guard: StorageGuardMut<D::Storage>, D: IndexDesc> Drop
     for IndexIteratorMut<'guard, Guard, D>
 {
     fn drop(&mut self) {
+        self.inner = None;
         let storage = self.guard.storage();
         let txn_id = storage.txn_id();
         let max_transaction_id = storage.max_committed_id();

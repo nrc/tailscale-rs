@@ -270,15 +270,12 @@ mod tests {
 
     const OWNER: &str = "owner";
 
-    fn notifier() -> Arc<TokioNotifier<TableStorage>> {
+    fn notifier() -> Arc<TokioNotifier<TableStorage, KvStore>> {
         TokioNotifier::new()
     }
 
-    fn insert_item(notifier: &TokioNotifier<TableStorage>, key: u32, value: &str) {
-        notifier
-            .store()
-            .table::<Items>(OWNER)
-            .insert(key, value.to_owned());
+    fn insert_item(notifier: &TokioNotifier<TableStorage, KvStore>, key: u32, value: &str) {
+        notifier.store().Items.insert(OWNER, key, value.to_owned());
     }
 
     /// Extract the `(key, value)` of an `Items` per-key upsert, panicking on any other notification.
@@ -310,7 +307,7 @@ mod tests {
     }
 
     /// Wait for the next notification, panicking if none arrives.
-    async fn recv_one(sub: &mut TokioSubscriber<TableStorage>) -> Notification {
+    async fn recv_one(sub: &mut TokioSubscriber<TableStorage, KvStore>) -> Notification {
         timeout(Duration::from_secs(1), sub.recv())
             .await
             .expect("timed out waiting for a notification")
@@ -318,7 +315,7 @@ mod tests {
     }
 
     /// Assert that no notification is delivered. Gives the background task a chance to run first.
-    async fn assert_idle(sub: &mut TokioSubscriber<TableStorage>) {
+    async fn assert_idle(sub: &mut TokioSubscriber<TableStorage, KvStore>) {
         match timeout(Duration::from_millis(50), sub.recv()).await {
             Err(_) => {} // nothing delivered, as expected
             Ok(Ok(n)) => panic!("expected no notification, got {n:?}"),
@@ -330,7 +327,7 @@ mod tests {
     async fn table_subscription_receives_events() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_table::<Items>().unwrap();
+        notifier.store().Items.subscribe(&sub).unwrap();
 
         // First insert into the empty table is a table-level upsert; the next is a per-key upsert.
         insert_item(&notifier, 1, "a");
@@ -348,7 +345,7 @@ mod tests {
         let notifier = notifier();
         insert_item(&notifier, 99, "x"); // seed so later inserts are per-key
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_key::<Items>(1).unwrap();
+        notifier.store().Items.subscribe_key(&sub, 1).unwrap();
 
         insert_item(&notifier, 2, "two"); // a different key: filtered out
         insert_item(&notifier, 1, "one"); // the subscribed key: delivered
@@ -364,9 +361,9 @@ mod tests {
     async fn singleton_subscription_receives_updates() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_singleton::<Count>().unwrap();
+        notifier.store().Count.subscribe(&sub).unwrap();
 
-        notifier.store().insert::<Count>(OWNER, 7);
+        notifier.store().Count.insert(OWNER, 7);
 
         assert_eq!(count_upsert(&recv_one(&mut sub).await), 7);
     }
@@ -375,10 +372,10 @@ mod tests {
     async fn global_subscription_sees_table_and_singleton() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_global().unwrap();
+        notifier.store().subscribe_global(&sub).unwrap();
 
         insert_item(&notifier, 1, "a");
-        notifier.store().insert::<Count>(OWNER, 9);
+        notifier.store().Count.insert(OWNER, 9);
 
         assert_eq!(items_table_upsert(&recv_one(&mut sub).await), vec![1]);
         assert_eq!(count_upsert(&recv_one(&mut sub).await), 9);
@@ -387,9 +384,9 @@ mod tests {
     #[tokio::test]
     async fn subscribe_singleton_and_notify_sends_current_value() {
         let notifier = notifier();
-        notifier.store().insert::<Count>(OWNER, 5); // pre-existing value, no subscribers yet
+        notifier.store().Count.insert(OWNER, 5); // pre-existing value, no subscribers yet
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_singleton_and_notify::<Count>().unwrap();
+        notifier.store().Count.subscribe_and_notify(&sub).unwrap();
 
         assert_eq!(count_upsert(&recv_one(&mut sub).await), 5);
     }
@@ -398,7 +395,7 @@ mod tests {
     async fn subscribe_singleton_and_notify_without_value_sends_nothing() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_singleton_and_notify::<Count>().unwrap();
+        notifier.store().Count.subscribe_and_notify(&sub).unwrap();
 
         assert_idle(&mut sub).await;
     }
@@ -408,7 +405,11 @@ mod tests {
         let notifier = notifier();
         insert_item(&notifier, 1, "one"); // pre-existing value, no subscribers yet
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_key_and_notify::<Items>(1).unwrap();
+        notifier
+            .store()
+            .Items
+            .subscribe_key_and_notify(&sub, 1)
+            .unwrap();
 
         assert_eq!(
             items_key_upsert(&recv_one(&mut sub).await),
@@ -420,12 +421,12 @@ mod tests {
     async fn unsubscribe_table_stops_notifications() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        let subscription = sub.subscribe_table::<Items>().unwrap();
+        let subscription = notifier.store().Items.subscribe(&sub).unwrap();
 
         insert_item(&notifier, 1, "a");
         recv_one(&mut sub).await; // the subscribed update, before we unsubscribe
 
-        sub.unsubscribe_table::<Items>(subscription);
+        notifier.store().Items.unsubscribe(subscription);
         insert_item(&notifier, 2, "b");
         assert_idle(&mut sub).await;
     }
@@ -434,13 +435,13 @@ mod tests {
     async fn unsubscribe_global_stops_notifications() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        let subscription = sub.subscribe_global().unwrap();
+        let subscription = notifier.store().subscribe_global(&sub).unwrap();
 
-        notifier.store().insert::<Count>(OWNER, 1);
+        notifier.store().Count.insert(OWNER, 1);
         recv_one(&mut sub).await; // the subscribed update, before we unsubscribe
 
-        sub.unsubscribe_global(subscription);
-        notifier.store().insert::<Count>(OWNER, 2);
+        notifier.store().unsubscribe_global(subscription);
+        notifier.store().Count.insert(OWNER, 2);
         assert_idle(&mut sub).await;
     }
 
@@ -448,13 +449,13 @@ mod tests {
     async fn unsubscribe_singleton_stops_notifications() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        let subscription = sub.subscribe_singleton::<Count>().unwrap();
+        let subscription = notifier.store().Count.subscribe(&sub).unwrap();
 
-        notifier.store().insert::<Count>(OWNER, 1);
+        notifier.store().Count.insert(OWNER, 1);
         recv_one(&mut sub).await; // the subscribed update, before we unsubscribe
 
-        sub.unsubscribe_singleton::<Count>(subscription);
-        notifier.store().insert::<Count>(OWNER, 2);
+        notifier.store().Count.unsubscribe(subscription);
+        notifier.store().Count.insert(OWNER, 2);
         assert_idle(&mut sub).await;
     }
 
@@ -463,10 +464,11 @@ mod tests {
         let notifier = notifier();
         let mut a = notifier.create_subscriber(OWNER);
         let mut b = notifier.create_subscriber(OWNER);
-        a.subscribe_singleton::<Count>().unwrap();
-        b.subscribe_singleton::<Count>().unwrap();
 
-        notifier.store().insert::<Count>(OWNER, 7);
+        let count = &notifier.store().Count;
+        count.subscribe(&a).unwrap();
+        count.subscribe(&b).unwrap();
+        count.insert(OWNER, 7);
 
         assert_eq!(count_upsert(&recv_one(&mut a).await), 7);
         assert_eq!(count_upsert(&recv_one(&mut b).await), 7);
@@ -476,18 +478,18 @@ mod tests {
     async fn dropping_subscriber_removes_it_and_leaves_others_working() {
         let notifier = notifier();
         let mut kept = notifier.create_subscriber(OWNER);
-        kept.subscribe_singleton::<Count>().unwrap();
+        notifier.store().Count.subscribe(&kept).unwrap();
 
         let gone = notifier.create_subscriber(OWNER);
         let gone_id = gone.id;
-        gone.subscribe_singleton::<Count>().unwrap();
+        notifier.store().Count.subscribe(&gone).unwrap();
         assert!(notifier.senders.lock().unwrap().contains_key(&gone_id));
 
         drop(gone);
         // Drop removes the subscriber's sender (and forgets it in the store).
         assert!(!notifier.senders.lock().unwrap().contains_key(&gone_id));
 
-        notifier.store().insert::<Count>(OWNER, 7);
+        notifier.store().Count.insert(OWNER, 7);
         assert_eq!(count_upsert(&recv_one(&mut kept).await), 7);
     }
 
@@ -495,15 +497,15 @@ mod tests {
     async fn try_recv_reports_empty_then_buffered() {
         let notifier = notifier();
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_singleton::<Count>().unwrap();
+        notifier.store().Count.subscribe(&sub).unwrap();
 
         // Nothing published yet.
         assert_eq!(sub.try_recv().unwrap_err(), Error::ChannelEmpty);
 
         // Two updates are queued before we await, so the background task delivers both in one round;
         // `recv_one` proves delivery happened and takes the first, leaving the second buffered.
-        notifier.store().insert::<Count>(OWNER, 1);
-        notifier.store().insert::<Count>(OWNER, 2);
+        notifier.store().Count.insert(OWNER, 1);
+        notifier.store().Count.insert(OWNER, 2);
         assert_eq!(count_upsert(&recv_one(&mut sub).await), 1);
         assert_eq!(count_upsert(&sub.try_recv().unwrap()), 2);
         assert_eq!(sub.try_recv().unwrap_err(), Error::ChannelEmpty);
@@ -514,7 +516,7 @@ mod tests {
         let notifier = notifier();
         insert_item(&notifier, 0, "v0"); // seed so inserts are per-key with distinct values
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_table::<Items>().unwrap();
+        notifier.store().Items.subscribe(&sub).unwrap();
 
         // Many more notifications than the (small, under-test) channel can hold at once, forcing the
         // full/requeue/retry path. Draining continuously resets the retry counter, so none is dropped.
@@ -536,7 +538,7 @@ mod tests {
         let notifier = notifier();
         insert_item(&notifier, 0, "v0"); // seed so inserts are per-key
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_table::<Items>().unwrap();
+        notifier.store().Items.subscribe(&sub).unwrap();
 
         // Fill the channel and keep committing without ever draining it. Yielding (rather than
         // sleeping) between commits lets the sending task run a round each time without advancing
@@ -550,7 +552,7 @@ mod tests {
         }
 
         // Still known to the store, i.e. it was not removed.
-        assert!(sub.subscribe_global().is_ok());
+        assert!(notifier.store().subscribe_global(&sub).is_ok());
 
         // And still receiving: the notifications buffered before the channel filled are intact.
         assert_eq!(
@@ -564,7 +566,7 @@ mod tests {
         let notifier = notifier();
         insert_item(&notifier, 0, "v0"); // seed so inserts are per-key
         let mut sub = notifier.create_subscriber(OWNER);
-        sub.subscribe_table::<Items>().unwrap();
+        notifier.store().Items.subscribe(&sub).unwrap();
 
         // Never drained: fill the channel and keep it full across every retry round.
         let n = CHANNEL_CAPACITY as u32 + 1;
@@ -576,7 +578,10 @@ mod tests {
         sleep(notify::RETRY_TIME * (notify::MAX_RETRIES + 2)).await;
 
         // Regression for the previously-panicking case: subscribing on a given-up subscriber errors.
-        assert_eq!(sub.subscribe_global(), Err(Error::UnknownSubscriber));
+        assert_eq!(
+            notifier.store().subscribe_global(&sub),
+            Err(ts_kv_store::Error::UnknownSubscriber)
+        );
 
         // Its channel is closed: the already-buffered notifications drain, then it reports closure.
         let mut drained = 0;

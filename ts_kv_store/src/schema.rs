@@ -1108,8 +1108,8 @@ mod test {
         );
 
         let store = KvStore::new();
-        store.insert::<Foo>("owner", Box::new(42));
-        assert_eq!(store.get::<Foo>("owner").unwrap(), Box::new(42));
+        store.Foo.insert("owner", Box::new(42));
+        assert_eq!(store.Foo.get("owner").unwrap(), Box::new(42));
     }
 
     #[test]
@@ -1118,18 +1118,27 @@ mod test {
 
         let store = KvStore::new();
 
-        store
-            .table::<Foo>("owner")
-            .insert("hello", "world".to_owned());
-        assert_eq!(store.table::<Foo>("owner").get("hello").unwrap(), "world");
+        store.Foo.insert("owner", "hello", "world".to_owned());
+        assert_eq!(store.Foo.get("owner", "hello").unwrap(), "world");
 
         store
-            .table::<Bar>("owner")
-            .insert(5, vec!["boo".to_owned(), "bang".to_owned()]);
+            .Bar
+            .insert("owner", 5, vec!["boo".to_owned(), "bang".to_owned()]);
         assert_eq!(
-            store.table::<Bar>("owner").get(&5).unwrap(),
+            store.Bar.get("owner", &5).unwrap(),
             vec!["boo".to_owned(), "bang".to_owned()]
         );
+    }
+
+    #[test]
+    fn send_and_sync() {
+        fn require_send<T: Send>(_t: T) {}
+        fn require_sync<T: Sync>(_t: T) {}
+
+        store!(tables: { Foo(&'static str => String; "owner"; notify(Clone)), Bar(u32 => Vec<String>; "owner")});
+
+        require_send(KvStore::new());
+        require_sync(KvStore::new());
     }
 
     #[test]
@@ -1146,22 +1155,18 @@ mod test {
         );
 
         let store = KvStore::new();
-        store.table::<Bar>("owner").insert(
+        store.Bar.insert(
+            "owner",
             5,
             BarT {
                 a: "hello".to_owned(),
             },
         );
-        let value = store
-            .table_by::<index::Bar::a>("owner")
-            .get("hello")
-            .unwrap();
+        let value = store.Bar.indexes().a.get("owner", "hello").unwrap();
         assert_eq!(value.1.a, "hello");
 
-        store
-            .table::<Foo>("owner")
-            .insert("foo", "hello".to_owned());
-        let value = store.table_by::<index::Foo::len>("owner").get(&5).unwrap();
+        store.Foo.insert("owner", "foo", "hello".to_owned());
+        let value = store.Foo.indexes().len.get("owner", &5).unwrap();
         assert_eq!(value, ("foo", "hello".to_owned()));
     }
 }

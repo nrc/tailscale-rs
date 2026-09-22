@@ -865,37 +865,29 @@ mod test {
     #[test]
     fn get_returns_none_when_absent() {
         let store = KvStore::new();
-        assert!(store.get::<Count>(OWNER).is_none());
+        assert!(store.Count.get(OWNER).is_none());
     }
 
     #[test]
     fn get_returns_value_after_insert() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 42);
-        assert_eq!(store.get::<Count>(OWNER), Some(42));
-    }
-
-    #[test]
-    fn get_returns_none_after_remove() {
-        let store = KvStore::new();
-        store.insert::<Count>(OWNER, 1);
-        store.remove::<Count>(OWNER);
-        assert!(store.get::<Count>(OWNER).is_none());
+        store.Count.insert(OWNER, 42);
+        assert_eq!(store.Count.get(OWNER), Some(42));
     }
 
     #[test]
     fn get_ref_singleton() {
         static STATIC_LABEL: u64 = 99;
         let store = KvStore::new();
-        store.insert::<Label>(OWNER, &STATIC_LABEL);
-        assert_eq!(store.get::<Label>(OWNER), Some(&99));
+        store.Label.insert(OWNER, &STATIC_LABEL);
+        assert_eq!(store.Label.get(OWNER), Some(&99));
     }
 
     #[test]
     fn with_returns_none_and_does_not_call_f_when_absent() {
         let store = KvStore::new();
         let mut called = false;
-        let result = store.with::<Count, ()>(OWNER, |_| {
+        let result = store.Count.with(OWNER, |_| {
             called = true;
         });
         assert!(result.is_none());
@@ -905,16 +897,16 @@ mod test {
     #[test]
     fn with_returns_result_of_f() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 5);
-        assert_eq!(store.with::<Count, _>(OWNER, |v| v * 2), Some(10));
+        store.Count.insert(OWNER, 5);
+        assert_eq!(store.Count.with(OWNER, |v| v * 2), Some(10));
     }
 
     #[test]
     fn get_arc_singleton_shares_allocation() {
         let store = KvStore::new();
         let arc = Arc::new("hello".to_owned());
-        store.insert::<Shared>(OWNER, arc.clone());
-        let got = store.get::<Shared>(OWNER).unwrap();
+        store.Shared.insert(OWNER, arc.clone());
+        let got = store.Shared.get(OWNER).unwrap();
         assert_eq!(*got, "hello");
         // `get` clones the `Arc` rather than the pointee.
         assert!(Arc::ptr_eq(&arc, &got));
@@ -924,7 +916,7 @@ mod test {
     fn with_mut_returns_none_and_does_not_call_f_when_absent() {
         let store = KvStore::new();
         let mut called = false;
-        let result = store.with_mut::<Count, ()>(OWNER, |_| {
+        let result = store.Count.with_mut(OWNER, |_| {
             called = true;
         });
         assert!(result.is_none());
@@ -934,74 +926,73 @@ mod test {
     #[test]
     fn with_mut_does_not_insert_when_absent() {
         let store = KvStore::new();
-        store.with_mut::<Count, _>(OWNER, |v| *v = 7);
-        assert!(store.get::<Count>(OWNER).is_none());
+        store.Count.with_mut(OWNER, |v| *v = 7);
+        assert!(store.Count.get(OWNER).is_none());
     }
 
     #[test]
     fn with_mut_passes_current_value() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 5);
+        store.Count.insert(OWNER, 5);
         let mut seen = None;
-        store.with_mut::<Count, _>(OWNER, |v| seen = Some(*v));
+        store.Count.with_mut(OWNER, |v| seen = Some(*v));
         assert_eq!(seen, Some(5));
     }
 
     #[test]
     fn with_mut_returns_result_of_f() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 5);
-        assert_eq!(store.with_mut::<Count, _>(OWNER, |v| *v * 2), Some(10));
+        store.Count.insert(OWNER, 5);
+        assert_eq!(store.Count.with_mut(OWNER, |v| *v * 2), Some(10));
     }
 
     #[test]
     fn with_mut_mutates_existing_value() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 5);
-        store.with_mut::<Count, _>(OWNER, |v| *v *= 2);
-        assert_eq!(store.get::<Count>(OWNER), Some(10));
+        store.Count.insert(OWNER, 5);
+        store.Count.with_mut(OWNER, |v| *v *= 2);
+        assert_eq!(store.Count.get(OWNER), Some(10));
     }
 
     #[test]
     fn with_mut_sees_previous_with_mut() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 0);
-        store.with_mut::<Count, _>(OWNER, |v| *v += 1);
-        store.with_mut::<Count, _>(OWNER, |v| *v += 1);
-        store.with_mut::<Count, _>(OWNER, |v| *v += 1);
-        assert_eq!(store.get::<Count>(OWNER), Some(3));
+        store.Count.insert(OWNER, 0);
+        store.Count.with_mut(OWNER, |v| *v += 1);
+        store.Count.with_mut(OWNER, |v| *v += 1);
+        store.Count.with_mut(OWNER, |v| *v += 1);
+        assert_eq!(store.Count.get(OWNER), Some(3));
     }
 
     #[test]
     fn with_mut_returns_none_after_remove() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 5);
-        store.remove::<Count>(OWNER);
+        store.Count.insert(OWNER, 5);
+        store.Count.remove(OWNER);
         let mut called = false;
-        let result = store.with_mut::<Count, ()>(OWNER, |_| called = true);
+        let result = store.Count.with_mut(OWNER, |_| called = true);
         assert!(result.is_none());
         assert!(!called);
-        assert!(store.get::<Count>(OWNER).is_none());
+        assert!(store.Count.get(OWNER).is_none());
     }
 
     #[test]
     fn with_mut_box_singleton() {
         let store = KvStore::new();
-        store.insert::<Boxed>(OWNER, Box::new("hello".to_owned()));
-        store.with_mut::<Boxed, _>(OWNER, |v| v.push('!'));
-        assert_eq!(
-            store.get::<Boxed>(OWNER),
-            Some(Box::new("hello!".to_owned()))
-        );
+        store.Boxed.insert(OWNER, Box::new("hello".to_owned()));
+        store.Boxed.with_mut(OWNER, |v| v.push('!'));
+        assert_eq!(store.Boxed.get(OWNER), Some(Box::new("hello!".to_owned())));
     }
 
     #[test]
     fn with_mut_arc_singleton() {
         let store = KvStore::new();
-        store.insert::<Shared>(OWNER, Arc::new("hello".to_owned()));
-        store.with_mut::<Shared, _>(OWNER, |v| *v = Arc::new(format!("{v}!")));
+        store.Shared.insert(OWNER, Arc::new("hello".to_owned()));
+        store
+            .Shared
+            .with_mut(OWNER, |v| *v = Arc::new(format!("{v}!")));
         assert_eq!(
-            store.get::<Shared>(OWNER).as_deref(),
+            store.Shared.get(OWNER).as_deref(),
             Some(&"hello!".to_owned())
         );
     }
@@ -1011,71 +1002,71 @@ mod test {
         static OLD_LABEL: u64 = 1;
         static NEW_LABEL: u64 = 2;
         let store = KvStore::new();
-        store.insert::<Label>(OWNER, &OLD_LABEL);
-        store.with_mut::<Label, _>(OWNER, |v| {
+        store.Label.insert(OWNER, &OLD_LABEL);
+        store.Label.with_mut(OWNER, |v| {
             assert_eq!(**v, 1);
             *v = &NEW_LABEL;
         });
-        assert_eq!(store.get::<Label>(OWNER), Some(&2));
+        assert_eq!(store.Label.get(OWNER), Some(&2));
     }
 
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "Ownership violation"))]
     fn with_mut_wrong_owner_panics() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 1);
-        store.with_mut::<Count, _>(OTHER, |v| *v = 2);
+        store.Count.insert(OWNER, 1);
+        store.Count.with_mut(OTHER, |v| *v = 2);
     }
 
     #[test]
     fn remove_makes_entry_absent() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 1);
-        store.remove::<Count>(OWNER);
-        assert!(store.get::<Count>(OWNER).is_none());
+        store.Count.insert(OWNER, 1);
+        store.Count.remove(OWNER);
+        assert!(store.Count.get(OWNER).is_none());
     }
 
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "Ownership violation"))]
     fn singleton_insert_wrong_owner_panics() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 1);
-        store.insert::<Count>(OTHER, 2);
+        store.Count.insert(OWNER, 1);
+        store.Count.insert(OTHER, 2);
     }
 
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "Ownership violation"))]
     fn singleton_remove_wrong_owner_panics() {
         let store = KvStore::new();
-        store.insert::<Count>(OWNER, 1);
-        store.remove::<Count>(OTHER);
+        store.Count.insert(OWNER, 1);
+        store.Count.remove(OTHER);
     }
 
     #[test]
     fn table_get_returns_none_when_absent() {
         let store = KvStore::new();
-        assert!(store.table::<Items>(OWNER).get("missing").is_none());
+        assert!(store.Items.get(OWNER, "missing").is_none());
     }
 
     #[test]
     fn table_get_returns_value_after_insert() {
         let store = KvStore::new();
-        store.table::<Items>(OWNER).insert("k", "val".to_owned());
-        assert_eq!(store.table::<Items>(OWNER).get("k"), Some("val".to_owned()));
+        store.Items.insert(OWNER, "k", "val".to_owned());
+        assert_eq!(store.Items.get(OWNER, "k"), Some("val".to_owned()));
     }
 
     #[test]
     fn table_get_with_borrow_type() {
         let store = KvStore::new();
-        store.table::<Counters>(OWNER).insert(42u32, 100u64);
-        assert_eq!(store.table::<Counters>(OWNER).get(&42u32), Some(100u64));
+        store.Counters.insert(OWNER, 42u32, 100u64);
+        assert_eq!(store.Counters.get(OWNER, &42u32), Some(100u64));
     }
 
     #[test]
     fn table_with_returns_none_and_does_not_call_f_when_absent() {
         let store = KvStore::new();
         let mut called = false;
-        let result = store.table::<Items>(OWNER).with("missing", |_| {
+        let result = store.Items.with(OWNER, "missing", |_| {
             called = true;
         });
         assert!(result.is_none());
@@ -1085,8 +1076,8 @@ mod test {
     #[test]
     fn table_with_returns_some_after_insert() {
         let store = KvStore::new();
-        store.table::<Items>(OWNER).insert("k", "val".to_owned());
-        assert_eq!(store.table::<Items>(OWNER).with("k", |s| s.len()), Some(3));
+        store.Items.insert(OWNER, "k", "val".to_owned());
+        assert_eq!(store.Items.with(OWNER, "k", |s| s.len()), Some(3));
     }
 
     #[test]
@@ -1094,8 +1085,8 @@ mod test {
         let store = KvStore::new();
         assert!(
             store
-                .table::<Items>(OWNER)
-                .with_mut(&"missing", |v| v.len())
+                .Items
+                .with_mut(OWNER, &"missing", |v| v.len())
                 .is_none()
         );
     }
@@ -1103,100 +1094,94 @@ mod test {
     #[test]
     fn table_mutate_modifies_value() {
         let store = KvStore::new();
-        store.table::<Items>(OWNER).insert("k", "hello".to_owned());
-        store
-            .table::<Items>(OWNER)
-            .with_mut(&"k", |v| v.push('!'))
-            .unwrap();
-        assert_eq!(
-            store.table::<Items>(OWNER).get("k"),
-            Some("hello!".to_owned())
-        );
+        store.Items.insert(OWNER, "k", "hello".to_owned());
+        store.Items.with_mut(OWNER, &"k", |v| v.push('!')).unwrap();
+        assert_eq!(store.Items.get(OWNER, "k"), Some("hello!".to_owned()));
     }
 
     #[test]
     fn table_remove_makes_get_return_none() {
         let store = KvStore::new();
-        store.table::<Items>(OWNER).insert("k", "v".to_owned());
-        store.table::<Items>(OWNER).remove(&"k");
-        assert!(store.table::<Items>(OWNER).get("k").is_none());
+        store.Items.insert(OWNER, "k", "v".to_owned());
+        store.Items.remove(OWNER, &"k");
+        assert!(store.Items.get(OWNER, "k").is_none());
     }
 
     #[test]
     fn table_clear_removes_all_rows() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "alpha".to_owned());
-        table.insert("b", "beta".to_owned());
-        table.insert("c", "gamma".to_owned());
-        table.clear();
+        let table = &store.Items;
+        table.insert(OWNER, "a", "alpha".to_owned());
+        table.insert(OWNER, "b", "beta".to_owned());
+        table.insert(OWNER, "c", "gamma".to_owned());
+        table.clear(OWNER);
         assert!(table.is_empty());
     }
 
     #[test]
     fn table_clear_preserves_ownership() {
         let store = KvStore::new();
-        store.table::<Items>(OWNER).insert("k", "v".to_owned());
-        store.table::<Items>(OWNER).clear();
+        store.Items.insert(OWNER, "k", "v".to_owned());
+        store.Items.clear(OWNER);
         // Same owner can still write after clear
-        store.table::<Items>(OWNER).insert("k2", "v2".to_owned());
-        assert_eq!(store.table::<Items>(OWNER).get("k2"), Some("v2".to_owned()));
+        store.Items.insert(OWNER, "k2", "v2".to_owned());
+        assert_eq!(store.Items.get(OWNER, "k2"), Some("v2".to_owned()));
     }
 
     #[test]
     fn table_is_empty_on_fresh_store() {
         let store = KvStore::new();
-        assert!(store.table::<Items>(OWNER).is_empty());
+        assert!(store.Items.is_empty());
     }
 
     #[test]
     fn table_len_zero_on_fresh_store() {
         let store = KvStore::new();
-        assert_eq!(store.table::<Items>(OWNER).len(), 0);
+        assert_eq!(store.Items.len(), 0);
     }
 
     #[test]
     fn table_len_increases_with_inserts() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "alpha".to_owned());
-        table.insert("b", "beta".to_owned());
-        table.insert("c", "gamma".to_owned());
+        let table = &store.Items;
+        table.insert(OWNER, "a", "alpha".to_owned());
+        table.insert(OWNER, "b", "beta".to_owned());
+        table.insert(OWNER, "c", "gamma".to_owned());
         assert_eq!(table.len(), 3);
     }
 
     #[test]
     fn table_len_decreases_after_remove() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "alpha".to_owned());
-        table.insert("b", "beta".to_owned());
-        table.remove(&"a");
+        let table = &store.Items;
+        table.insert(OWNER, "a", "alpha".to_owned());
+        table.insert(OWNER, "b", "beta".to_owned());
+        table.remove(OWNER, &"a");
         assert_eq!(table.len(), 1);
     }
 
     #[test]
     fn table_is_empty_false_after_insert() {
         let store = KvStore::new();
-        store.table::<Items>(OWNER).insert("k", "v".to_owned());
-        assert!(!store.table::<Items>(OWNER).is_empty());
+        store.Items.insert(OWNER, "k", "v".to_owned());
+        assert!(!store.Items.is_empty());
     }
 
     #[test]
     fn table_iter_empty_on_fresh_store() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        let items: Vec<_> = table.iter().collect();
+        let table = &store.Items;
+        let items: Vec<_> = table.iter(OWNER).collect();
         assert!(items.is_empty());
     }
 
     #[test]
     fn table_iter_yields_all_rows() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "alpha".to_owned());
-        table.insert("b", "beta".to_owned());
-        let mut items: Vec<_> = table.iter().collect();
+        let table = &store.Items;
+        table.insert(OWNER, "a", "alpha".to_owned());
+        table.insert(OWNER, "b", "beta".to_owned());
+        let mut items: Vec<_> = table.iter(OWNER).collect();
         items.sort();
         assert_eq!(
             items,
@@ -1207,35 +1192,37 @@ mod test {
     #[test]
     fn table_iter_reflects_mutations() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("k", "v1".to_owned());
+        let table = &store.Items;
+        table.insert(OWNER, "k", "v1".to_owned());
         table
-            .with_mut(&"k", |v| {
+            .with_mut(OWNER, &"k", |v| {
                 v.clear();
                 v.push_str("v2");
             })
             .unwrap();
-        let items: Vec<_> = table.iter().collect();
+        let items: Vec<_> = table.iter(OWNER).collect();
         assert_eq!(items, vec![(&"k", &"v2".to_owned())]);
     }
 
     #[test]
     fn table_for_each_empty_calls_closure_zero_times() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
+        let table = &store.Items;
         let mut count = 0;
-        table.iter().for_each(|_| count += 1);
+        table.iter(OWNER).for_each(|_| count += 1);
         assert_eq!(count, 0);
     }
 
     #[test]
     fn table_for_each_yields_all_rows() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "alpha".to_owned());
-        table.insert("b", "beta".to_owned());
+        let table = &store.Items;
+        table.insert(OWNER, "a", "alpha".to_owned());
+        table.insert(OWNER, "b", "beta".to_owned());
         let mut items: Vec<_> = Vec::new();
-        table.iter().for_each(|(k, v)| items.push((*k, v.clone())));
+        table
+            .iter(OWNER)
+            .for_each(|(k, v)| items.push((*k, v.clone())));
         items.sort();
         assert_eq!(
             items,
@@ -1246,52 +1233,52 @@ mod test {
     #[test]
     fn table_with_iter_mut_modifies_values() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("k", "hello".to_owned());
-        table.with_iter_mut(|i| i.next().unwrap().1.push('!'));
-        assert_eq!(table.get("k"), Some("hello!".to_owned()));
+        let table = &store.Items;
+        table.insert(OWNER, "k", "hello".to_owned());
+        table.with_iter_mut(OWNER, |i| i.next().unwrap().1.push('!'));
+        assert_eq!(table.get(OWNER, "k"), Some("hello!".to_owned()));
     }
 
     #[test]
     fn table_with_iter_mut_empty_yields_none() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        let count = table.with_iter_mut(|i| i.count());
+        let table = &store.Items;
+        let count = table.with_iter_mut(OWNER, |i| i.count());
         assert_eq!(count, 0);
     }
 
     #[test]
     fn table_with_iter_mut_visits_all_rows() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "x".to_owned());
-        table.insert("b", "y".to_owned());
-        table.insert("c", "z".to_owned());
-        table.with_iter_mut(|i| {
+        let table = &store.Items;
+        table.insert(OWNER, "a", "x".to_owned());
+        table.insert(OWNER, "b", "y".to_owned());
+        table.insert(OWNER, "c", "z".to_owned());
+        table.with_iter_mut(OWNER, |i| {
             for (_, v) in i {
                 v.push('!');
             }
         });
-        assert_eq!(table.get("a"), Some("x!".to_owned()));
-        assert_eq!(table.get("b"), Some("y!".to_owned()));
-        assert_eq!(table.get("c"), Some("z!".to_owned()));
+        assert_eq!(table.get(OWNER, "a"), Some("x!".to_owned()));
+        assert_eq!(table.get(OWNER, "b"), Some("y!".to_owned()));
+        assert_eq!(table.get(OWNER, "c"), Some("z!".to_owned()));
     }
 
     #[test]
     fn table_iter_keys_cloned_empty() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        let keys: Vec<_> = table.keys().collect();
+        let table = &store.Items;
+        let keys: Vec<_> = table.keys(OWNER).collect();
         assert!(keys.is_empty());
     }
 
     #[test]
     fn table_iter_keys_cloned_yields_all_keys() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "alpha".to_owned());
-        table.insert("b", "beta".to_owned());
-        let mut keys: Vec<_> = table.keys().copied().collect();
+        let table = &store.Items;
+        table.insert(OWNER, "a", "alpha".to_owned());
+        table.insert(OWNER, "b", "beta".to_owned());
+        let mut keys: Vec<_> = table.keys(OWNER).copied().collect();
         keys.sort();
         assert_eq!(keys, vec!["a", "b"]);
     }
@@ -1299,18 +1286,18 @@ mod test {
     #[test]
     fn table_iter_values_cloned_empty() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        let values: Vec<_> = table.values().collect();
+        let table = &store.Items;
+        let values: Vec<_> = table.values(OWNER).collect();
         assert!(values.is_empty());
     }
 
     #[test]
     fn table_iter_values_cloned_yields_all_values() {
         let store = KvStore::new();
-        let table = store.table::<Items>(OWNER);
-        table.insert("a", "alpha".to_owned());
-        table.insert("b", "beta".to_owned());
-        let mut values: Vec<_> = table.values().collect();
+        let table = &store.Items;
+        table.insert(OWNER, "a", "alpha".to_owned());
+        table.insert(OWNER, "b", "beta".to_owned());
+        let mut values: Vec<_> = table.values(OWNER).collect();
         values.sort();
         assert_eq!(values, vec!["alpha", "beta"]);
     }
@@ -1320,38 +1307,121 @@ mod test {
     #[should_panic(expected = "Ownership violation")]
     fn table_insert_wrong_owner_panics() {
         let store = KvStore::new();
-        store.table::<Items>(OTHER).insert("k", "v".to_owned());
+        store.Items.insert(OTHER, "k", "v".to_owned());
     }
 
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "Ownership violation"))]
     fn table_mutate_wrong_owner_panics() {
         let store = KvStore::new();
-        store
-            .table::<Items>(OTHER)
-            .with_mut(&"k", |v| v.len())
-            .unwrap_err();
+        store.Items.with_mut(OTHER, &"k", |v| v.len()).unwrap_err();
     }
 
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "Ownership violation"))]
     fn table_remove_wrong_owner_panics() {
         let store = KvStore::new();
-        store.table::<Items>(OTHER).remove(&"k");
+        store.Items.remove(OTHER, &"k");
     }
 
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "Ownership violation"))]
     fn table_clear_wrong_owner_panics() {
         let store = KvStore::new();
-        store.table::<Items>(OTHER).clear();
+        store.Items.clear(OTHER);
     }
 
     #[test]
     fn table_remove_used_in_statement_position() {
         let store = KvStore::new();
-        store.table::<Items>(OWNER).insert("k", "v".to_owned());
-        store.table::<Items>(OWNER).remove(&"k");
-        assert_eq!(store.table::<Items>(OWNER).get("k"), None);
+        store.Items.insert(OWNER, "k", "v".to_owned());
+        store.Items.remove(OWNER, &"k");
+        assert_eq!(store.Items.get(OWNER, "k"), None);
+    }
+
+    #[test]
+    fn with_owner_singleton_round_trip() {
+        let store = KvStore::new();
+        let owned = store.with_owner(OWNER);
+
+        owned.Count.insert(5);
+        assert_eq!(owned.Count.get(), Some(5));
+        assert_eq!(owned.Count.with(|v| v * 2), Some(10));
+        assert_eq!(owned.Count.with_mut(|v| *v += 1), Some(()));
+        assert_eq!(owned.Count.get(), Some(6));
+
+        owned.Count.remove();
+        assert!(owned.Count.get().is_none());
+    }
+
+    #[test]
+    fn with_owner_table_round_trip() {
+        let store = KvStore::new();
+        let owned = store.with_owner(OWNER);
+
+        owned.Items.insert("a", "alpha".to_owned());
+        owned.Items.insert("b", "beta".to_owned());
+        assert_eq!(owned.Items.get("a"), Some("alpha".to_owned()));
+        assert_eq!(owned.Items.with("a", |v| v.len()), Some(5));
+        assert_eq!(owned.Items.len(), 2);
+        assert!(!owned.Items.is_empty());
+
+        owned.Items.with_mut(&"a", |v| v.push('!')).unwrap();
+        assert_eq!(owned.Items.get("a"), Some("alpha!".to_owned()));
+
+        let mut keys: Vec<_> = owned.Items.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b"]);
+        assert_eq!(owned.Items.iter().count(), 2);
+        assert_eq!(owned.Items.values().count(), 2);
+
+        owned.Items.with_iter_mut(|i| {
+            for (_, v) in i {
+                v.push('?');
+            }
+        });
+        assert_eq!(owned.Items.get("b"), Some("beta?".to_owned()));
+
+        owned.Items.remove(&"a");
+        assert_eq!(owned.Items.len(), 1);
+        owned.Items.clear();
+        assert!(owned.Items.is_empty());
+    }
+
+    #[test]
+    fn with_owner_writes_visible_to_the_store() {
+        let store = KvStore::new();
+        {
+            let owned = store.with_owner(OWNER);
+            owned.Count.insert(7);
+            owned.Items.insert("k", "v".to_owned());
+        }
+        assert_eq!(store.Count.get(OWNER), Some(7));
+        assert_eq!(store.Items.get(OWNER, "k"), Some("v".to_owned()));
+    }
+
+    #[test]
+    fn with_owner_transaction_uses_the_owner() {
+        let store = KvStore::new();
+        let owned = store.with_owner(OWNER);
+
+        let mut txn = owned.begin_transaction();
+        txn.Count.insert(1);
+        txn.Items.insert("k", "v".to_owned());
+        txn.commit().unwrap();
+
+        assert_eq!(owned.Count.get(), Some(1));
+
+        let txn = owned.begin_ro_transaction();
+        assert_eq!(txn.Items.get("k"), Some("v".to_owned()));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Ownership violation")]
+    fn with_owner_wrong_owner_panics() {
+        let store = KvStore::new();
+        store.Count.insert(OWNER, 1);
+        store.with_owner(OTHER).Count.insert(2);
     }
 }

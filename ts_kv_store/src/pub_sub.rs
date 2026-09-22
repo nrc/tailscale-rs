@@ -1578,20 +1578,18 @@ mod tests {
     fn e2e_single_key_subscription() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
 
         // Pre-populate before subscribing so the table is non-empty (a first insert into an empty
         // table is reported as a table-level upsert, not a per-key one).
-        store.table::<Items>(OWNER).insert(99, "x".to_owned());
-        let sub = store
-            .table::<Items>(OWNER)
-            .subscribe_key(subscriber, 1)
-            .unwrap();
+        owned.Items.insert(99, "x".to_owned());
+        let sub = owned.Items.subscribe_key(subscriber, 1).unwrap();
         rec.reset();
 
-        store.table::<Items>(OWNER).insert(1, "one".to_owned());
-        store.table::<Items>(OWNER).insert(2, "two".to_owned());
-        store.table::<Items>(OWNER).remove(&1);
+        owned.Items.insert(1, "one".to_owned());
+        owned.Items.insert(2, "two".to_owned());
+        owned.Items.remove(&1);
 
         let got = rec.notifications_for(sub);
         // The insert of key 2 is filtered out; only key 1's upsert and removal remain.
@@ -1609,17 +1607,17 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.insert(1, "a".to_owned());
             t.insert(2, "b".to_owned());
         }
         txn.commit().unwrap();
-        store.table::<Items>(OWNER).clear();
+        store.Items.clear(OWNER);
 
         let got = rec.notifications_for(sub);
         assert_eq!(
@@ -1632,12 +1630,13 @@ mod tests {
     fn e2e_global_subscription_sees_all_tables() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe_global(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.subscribe_global(subscriber).unwrap();
         rec.reset();
 
-        store.table::<Items>(OWNER).insert(1, "a".to_owned());
-        store.table::<Plain>(OWNER).insert(2, "b".to_owned());
+        owned.Items.insert(1, "a".to_owned());
+        owned.Plain.insert(2, "b".to_owned());
 
         let got = rec.notifications_for(sub);
         assert_eq!(got.len(), 2);
@@ -1656,8 +1655,8 @@ mod tests {
         let sub = store.subscribe_global(subscriber).unwrap();
         rec.reset();
 
-        store.insert::<Count>(OWNER, 7);
-        store.remove::<Count>(OWNER);
+        store.Count.insert(OWNER, 7);
+        store.Count.remove(OWNER);
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -1672,15 +1671,16 @@ mod tests {
     fn e2e_first_insert_into_empty_table_is_table_upsert() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         // The very first insert takes the table from empty to non-empty and so is reported as a
         // table-level upsert...
-        store.table::<Items>(OWNER).insert(1, "a".to_owned());
+        owned.Items.insert(1, "a".to_owned());
         // ...but a later insert into the now non-empty table is a per-key upsert.
-        store.table::<Items>(OWNER).insert(2, "b".to_owned());
+        owned.Items.insert(2, "b".to_owned());
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -1699,11 +1699,11 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
+        let sub = store.Count.subscribe(subscriber).unwrap();
         rec.reset();
 
-        store.insert::<Count>(OWNER, 42);
-        store.remove::<Count>(OWNER);
+        store.Count.insert(OWNER, 42);
+        store.Count.remove(OWNER);
 
         let got = rec.notifications_for(sub);
         assert_eq!(
@@ -1716,12 +1716,13 @@ mod tests {
     fn e2e_valueless_singleton_subscription() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Quiet>(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Quiet.subscribe(subscriber).unwrap();
         rec.reset();
 
-        store.insert::<Quiet>(OWNER, 42);
-        store.remove::<Quiet>(OWNER);
+        owned.Quiet.insert(42);
+        owned.Quiet.remove();
 
         // Without `notify(Clone)` the value is not sent, but a removal must still arrive as a
         // removal rather than as an upsert of nothing.
@@ -1737,11 +1738,11 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Shared>(subscriber).unwrap();
+        let sub = store.Shared.subscribe(subscriber).unwrap();
         rec.reset();
 
-        store.insert::<Shared>(OWNER, Arc::new("hello".to_owned()));
-        store.remove::<Shared>(OWNER);
+        store.Shared.insert(OWNER, Arc::new("hello".to_owned()));
+        store.Shared.remove(OWNER);
 
         let got = rec.notifications_for(sub);
         assert_eq!(got.len(), 2);
@@ -1759,13 +1760,14 @@ mod tests {
     fn e2e_singleton_with_mut_notifies_with_new_value() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 0);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Count.subscribe(subscriber).unwrap();
+        owned.Count.insert(0);
         rec.reset();
 
-        store.with_mut::<Count, _>(OWNER, |v| *v += 1);
-        store.with_mut::<Count, _>(OWNER, |v| *v += 1);
+        owned.Count.with_mut(|v| *v += 1);
+        owned.Count.with_mut(|v| *v += 1);
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -1781,11 +1783,11 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 0);
+        store.Count.subscribe(subscriber).unwrap();
+        store.Count.insert(OWNER, 0);
         rec.reset();
 
-        store.with_mut::<Count, _>(OWNER, |v| *v = 1);
+        store.Count.with_mut(OWNER, |v| *v = 1);
 
         // Each `with_mut` is its own transaction, so it commits (and notifies) exactly once.
         assert_eq!(rec.total_calls(), 1);
@@ -1795,12 +1797,13 @@ mod tests {
     fn e2e_singleton_with_mut_to_same_value_does_not_notify() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 7);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Count.subscribe(subscriber).unwrap();
+        owned.Count.insert(7);
         rec.reset();
 
-        store.with_mut::<Count, _>(OWNER, |_| ());
+        owned.Count.with_mut(|_| ());
 
         assert!(rec.notifications_for(sub).is_empty());
     }
@@ -1810,13 +1813,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 0);
+        let sub = store.Count.subscribe(subscriber).unwrap();
+        store.Count.insert(OWNER, 0);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
-        txn.insert::<Count>(7);
-        txn.with_mut::<Count, _>(|v| *v = 7);
+        txn.Count.insert(7);
+        txn.Count.with_mut(|v| *v = 7);
         txn.commit().unwrap();
 
         assert_eq!(
@@ -1832,13 +1835,14 @@ mod tests {
     fn e2e_singleton_with_mut_after_remove_does_not_notify() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 7);
-        store.remove::<Count>(OWNER);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Count.subscribe(subscriber).unwrap();
+        owned.Count.insert(7);
+        owned.Count.remove();
         rec.reset();
 
-        assert!(store.with_mut::<Count, _>(OWNER, |_| panic!()).is_none());
+        assert!(owned.Count.with_mut(|_| panic!()).is_none());
 
         assert!(rec.notifications_for(sub).is_empty());
     }
@@ -1848,15 +1852,15 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 7);
-        store.remove::<Count>(OWNER);
+        let sub = store.Count.subscribe(subscriber).unwrap();
+        store.Count.insert(OWNER, 7);
+        store.Count.remove(OWNER);
         rec.reset();
 
         // As above, but in a transaction which goes on to commit real work elsewhere.
         let mut txn = store.begin_transaction(OWNER);
-        assert!(txn.with_mut::<Count, _>(|_| panic!()).is_none());
-        txn.table::<Items>().insert(1, "a".to_owned());
+        assert!(txn.Count.with_mut(|_| panic!()).is_none());
+        txn.Items.insert(1, "a".to_owned());
         txn.commit().unwrap();
 
         assert!(rec.notifications_for(sub).is_empty());
@@ -1866,16 +1870,17 @@ mod tests {
     fn e2e_commit_without_singleton_writes_does_not_renotify() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 1);
-        store.insert::<Count>(OWNER, 2);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Count.subscribe(subscriber).unwrap();
+        owned.Count.insert(1);
+        owned.Count.insert(2);
         rec.reset();
 
         // Both of `Count`'s slots now hold committed values, but a transaction which doesn't touch
         // `Count` must not re-deliver it.
-        let mut txn = store.begin_transaction(OWNER);
-        txn.table::<Items>().insert(9, "z".to_owned());
+        let mut txn = owned.begin_transaction();
+        txn.Items.insert(9, "z".to_owned());
         txn.commit().unwrap();
 
         assert!(rec.notifications_for(sub).is_empty());
@@ -1886,11 +1891,11 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
+        let sub = store.Count.subscribe(subscriber).unwrap();
         rec.reset();
 
         // There is no value to mutate, so nothing changes and there is nothing to notify about.
-        assert!(store.with_mut::<Count, _>(OWNER, |v| *v = 1).is_none());
+        assert!(store.Count.with_mut(OWNER, |v| *v = 1).is_none());
 
         assert!(rec.notifications_for(sub).is_empty());
     }
@@ -1899,14 +1904,15 @@ mod tests {
     fn e2e_singleton_with_mut_coalesced_within_one_transaction() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 0);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Count.subscribe(subscriber).unwrap();
+        owned.Count.insert(0);
         rec.reset();
 
-        let mut txn = store.begin_transaction(OWNER);
-        txn.with_mut::<Count, _>(|v| *v += 1);
-        txn.with_mut::<Count, _>(|v| *v += 1);
+        let mut txn = owned.begin_transaction();
+        txn.Count.with_mut(|v| *v += 1);
+        txn.Count.with_mut(|v| *v += 1);
         txn.commit().unwrap();
 
         // Subscribers see the net effect of the transaction, notified once.
@@ -1925,30 +1931,31 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 1);
+        let sub = store.Count.subscribe(subscriber).unwrap();
+        store.Count.insert(OWNER, 1);
         rec.reset();
 
         {
             let mut txn = store.begin_transaction(OWNER);
-            txn.with_mut::<Count, _>(|v| *v += 1);
+            txn.Count.with_mut(|v| *v += 1);
             // Dropped without `commit`, so the transaction rolls back and never notifies.
         }
 
         assert!(rec.notifications_for(sub).is_empty());
-        assert_eq!(store.get::<Count>(OWNER), Some(1));
+        assert_eq!(store.Count.get(OWNER), Some(1));
     }
 
     #[test]
     fn e2e_arc_singleton_with_mut_notifies() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Shared>(subscriber).unwrap();
-        store.insert::<Shared>(OWNER, Arc::new("hello".to_owned()));
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Shared.subscribe(subscriber).unwrap();
+        owned.Shared.insert(Arc::new("hello".to_owned()));
         rec.reset();
 
-        store.with_mut::<Shared, _>(OWNER, |v| *v = Arc::new(format!("{v}!")));
+        owned.Shared.with_mut(|v| *v = Arc::new(format!("{v}!")));
 
         let got = rec.notifications_for(sub);
         assert_eq!(got.len(), 1);
@@ -1963,11 +1970,11 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let shared_sub = store.subscribe::<Shared>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 0);
+        let shared_sub = store.Shared.subscribe(subscriber).unwrap();
+        store.Count.insert(OWNER, 0);
         rec.reset();
 
-        store.with_mut::<Count, _>(OWNER, |v| *v = 1);
+        store.Count.with_mut(OWNER, |v| *v = 1);
 
         assert!(rec.notifications_for(shared_sub).is_empty());
     }
@@ -1976,10 +1983,11 @@ mod tests {
     fn e2e_no_singleton_subscribers_commits_mutated_value() {
         let (notifier, _rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
+        let owned = store.with_owner(OWNER);
 
-        store.insert::<Count>(OWNER, 0);
-        store.with_mut::<Count, _>(OWNER, |v| *v += 7);
-        assert_eq!(store.get::<Count>(OWNER), Some(7));
+        owned.Count.insert(0);
+        owned.Count.with_mut(|v| *v += 7);
+        assert_eq!(owned.Count.get(), Some(7));
     }
 
     #[test]
@@ -1988,10 +1996,10 @@ mod tests {
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
         let sub = store.subscribe_global(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 0);
+        store.Count.insert(OWNER, 0);
         rec.reset();
 
-        store.with_mut::<Count, _>(OWNER, |v| *v = 3);
+        store.Count.with_mut(OWNER, |v| *v = 3);
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -2006,18 +2014,16 @@ mod tests {
     fn e2e_notifications_grouped_by_subscription() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber_a = store.register_subscriber(OWNER);
-        let subscriber_b = store.register_subscriber(OWNER);
+        let owned = store.with_owner(OWNER);
+        let subscriber_a = owned.register_subscriber();
+        let subscriber_b = owned.register_subscriber();
 
-        store.table::<Items>(OWNER).insert(99, "x".to_owned());
-        let key_sub = store
-            .table::<Items>(OWNER)
-            .subscribe_key(subscriber_a, 1)
-            .unwrap();
-        let table_sub = store.table::<Items>(OWNER).subscribe(subscriber_b).unwrap();
+        owned.Items.insert(99, "x".to_owned());
+        let key_sub = owned.Items.subscribe_key(subscriber_a, 1).unwrap();
+        let table_sub = owned.Items.subscribe(subscriber_b).unwrap();
         rec.reset();
 
-        store.table::<Items>(OWNER).insert(1, "one".to_owned());
+        owned.Items.insert(1, "one".to_owned());
 
         assert_eq!(
             rec.notifications_for(key_sub)
@@ -2040,12 +2046,12 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
 
-        store.table::<Items>(OWNER).unsubscribe(sub);
+        store.Items.unsubscribe(sub);
         rec.reset();
 
-        store.table::<Items>(OWNER).insert(1, "a".to_owned());
+        store.Items.insert(OWNER, 1, "a".to_owned());
         assert!(rec.notifications_for(sub).is_empty());
     }
 
@@ -2053,15 +2059,16 @@ mod tests {
     fn e2e_unsubscribe_global_stops_notifications() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let gone = store.subscribe_global(subscriber).unwrap();
-        let kept = store.subscribe_global(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let gone = owned.subscribe_global(subscriber).unwrap();
+        let kept = owned.subscribe_global(subscriber).unwrap();
 
-        store.unsubscribe_global(gone);
+        owned.unsubscribe_global(gone);
         rec.reset();
 
-        store.table::<Items>(OWNER).insert(1, "a".to_owned());
-        store.insert::<Count>(OWNER, 7);
+        owned.Items.insert(1, "a".to_owned());
+        owned.Count.insert(7);
 
         assert!(rec.notifications_for(gone).is_empty());
         // Removing one global subscription must leave the others in place.
@@ -2078,16 +2085,16 @@ mod tests {
         let gone = store.register_subscriber(OWNER);
         let kept = store.register_subscriber(OWNER);
 
-        let table_sub = store.table::<Items>(OWNER).subscribe(gone).unwrap();
-        let singleton_sub = store.subscribe::<Count>(gone).unwrap();
+        let table_sub = store.Items.subscribe(gone).unwrap();
+        let singleton_sub = store.Count.subscribe(gone).unwrap();
         let global_sub = store.subscribe_global(gone).unwrap();
-        let kept_sub = store.table::<Items>(OWNER).subscribe(kept).unwrap();
+        let kept_sub = store.Items.subscribe(kept).unwrap();
 
         store.remove_subscriber(gone);
         rec.reset();
 
-        store.table::<Items>(OWNER).insert(1, "a".to_owned());
-        store.insert::<Count>(OWNER, 7);
+        store.Items.insert(OWNER, 1, "a".to_owned());
+        store.Count.insert(OWNER, 7);
 
         // All of the removed subscriber's subscriptions are dead, whatever they watched...
         assert!(rec.notifications_for(table_sub).is_empty());
@@ -2107,16 +2114,17 @@ mod tests {
     fn e2e_removed_subscriber_cannot_subscribe_again() {
         let (notifier, _rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
 
-        store.remove_subscriber(subscriber);
+        owned.remove_subscriber(subscriber);
 
         assert_eq!(
-            store.table::<Items>(OWNER).subscribe(subscriber),
+            owned.Items.subscribe(subscriber),
             Err(Error::UnknownSubscriber)
         );
         assert_eq!(
-            store.subscribe::<Count>(subscriber),
+            owned.Count.subscribe(subscriber),
             Err(Error::UnknownSubscriber)
         );
     }
@@ -2127,7 +2135,7 @@ mod tests {
     fn seed_items(store: &KvStore, keys: &[u32]) {
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             for k in keys {
                 t.insert(*k, format!("v{k}"));
             }
@@ -2140,13 +2148,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut table = txn.table::<Items>();
+            let table = &mut txn.Items;
             for (_, v) in table.iter_mut() {
                 v.push('!');
             }
@@ -2162,17 +2170,15 @@ mod tests {
     fn e2e_iter_mut_notifies_key_subscription() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store
-            .table::<Items>(OWNER)
-            .subscribe_key(subscriber, 1)
-            .unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe_key(subscriber, 1).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut table = txn.table::<Items>();
+            let table = &mut txn.Items;
             for (_, v) in table.iter_mut() {
                 v.push('!');
             }
@@ -2192,13 +2198,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut table = txn.table::<Items>();
+            let table = &mut txn.Items;
             table.iter_mut().next().unwrap().1.push('!');
         }
         txn.commit().unwrap();
@@ -2219,14 +2225,15 @@ mod tests {
     fn e2e_iter_mut_with_remove_in_same_txn() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2, 3]);
         rec.reset();
 
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut table = txn.table::<Items>();
+            let table = &mut txn.Items;
             table.remove(&2);
             // `iter_mut` skips the removed key, so key 2 is only reported as a removal.
             for (_, v) in table.iter_mut() {
@@ -2249,12 +2256,12 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut table = txn.table::<Items>();
+            let table = &mut txn.Items;
             assert_eq!(table.iter_mut().count(), 0);
         }
         txn.commit().unwrap();
@@ -2266,13 +2273,14 @@ mod tests {
     fn e2e_rolled_back_transaction_notifies_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let _sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let _sub = owned.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         {
-            let mut txn = store.begin_transaction(OWNER);
-            txn.table::<Items>().insert(1, "a".to_owned());
+            let mut txn = owned.begin_transaction();
+            txn.Items.insert(1, "a".to_owned());
             // Dropped without `commit`, so the transaction rolls back and never notifies.
         }
 
@@ -2284,12 +2292,12 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.insert(1, "a".to_owned());
             t.insert(2, "b".to_owned());
             t.insert(3, "c".to_owned());
@@ -2310,16 +2318,17 @@ mod tests {
     fn e2e_insert_then_remove_in_one_txn_notifies_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         // Seed an unrelated key so the table is non-empty and the transaction below is not an
         // empty -> non-empty transition.
         seed_items(&store, &[9]);
         rec.reset();
 
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.insert(1, "a".to_owned());
             t.remove(&1);
         }
@@ -2334,13 +2343,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[9]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.insert(1, "a".to_owned());
             t.remove(&1);
             // A key which did exist before the transaction is still reported as removed.
@@ -2361,13 +2370,14 @@ mod tests {
     fn e2e_insert_then_clear_in_one_txn_notifies_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.insert(1, "a".to_owned());
             t.clear();
         }
@@ -2383,13 +2393,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.insert(2, "b".to_owned());
             t.clear();
         }
@@ -2410,13 +2420,14 @@ mod tests {
     fn e2e_subscribe_and_notify_singleton_sends_current_value() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        store.insert::<Count>(OWNER, 6);
-        store.insert::<Count>(OWNER, 7);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        owned.Count.insert(6);
+        owned.Count.insert(7);
         rec.reset();
 
         // Subscribing delivers the current value immediately, before any further mutation.
-        let sub = store.subscribe_and_notify::<Count>(subscriber).unwrap();
+        let sub = owned.Count.subscribe_and_notify(subscriber).unwrap();
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -2432,10 +2443,10 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        store.insert::<Quiet>(OWNER, 7);
+        store.Quiet.insert(OWNER, 7);
         rec.reset();
 
-        let sub = store.subscribe_and_notify::<Quiet>(subscriber).unwrap();
+        let sub = store.Quiet.subscribe_and_notify(subscriber).unwrap();
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -2450,12 +2461,13 @@ mod tests {
     fn e2e_subscribe_and_notify_valueless_singleton_without_value_sends_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        store.insert::<Quiet>(OWNER, 7);
-        store.remove::<Quiet>(OWNER);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        owned.Quiet.insert(7);
+        owned.Quiet.remove();
         rec.reset();
 
-        let sub = store.subscribe_and_notify::<Quiet>(subscriber).unwrap();
+        let sub = owned.Quiet.subscribe_and_notify(subscriber).unwrap();
 
         // The value has been removed, so there is nothing to report.
         assert!(rec.notifications_for(sub).is_empty());
@@ -2469,7 +2481,7 @@ mod tests {
         let subscriber = store.register_subscriber(OWNER);
         rec.reset();
 
-        let sub = store.subscribe_and_notify::<Count>(subscriber).unwrap();
+        let sub = store.Count.subscribe_and_notify(subscriber).unwrap();
 
         // There is no current value, so nothing is sent and no `notify` call is made at all.
         assert!(rec.notifications_for(sub).is_empty());
@@ -2480,13 +2492,14 @@ mod tests {
     fn e2e_subscribe_and_notify_singleton_then_receives_updates() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        store.insert::<Count>(OWNER, 7);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        owned.Count.insert(7);
         rec.reset();
 
-        let sub = store.subscribe_and_notify::<Count>(subscriber).unwrap();
-        store.insert::<Count>(OWNER, 8);
-        store.remove::<Count>(OWNER);
+        let sub = owned.Count.subscribe_and_notify(subscriber).unwrap();
+        owned.Count.insert(8);
+        owned.Count.remove();
 
         // The initial value is followed by the ordinary stream of subsequent updates.
         assert_eq!(
@@ -2507,10 +2520,10 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        store.insert::<Shared>(OWNER, Arc::new("hello".to_owned()));
+        store.Shared.insert(OWNER, Arc::new("hello".to_owned()));
         rec.reset();
 
-        let sub = store.subscribe_and_notify::<Shared>(subscriber).unwrap();
+        let sub = store.Shared.subscribe_and_notify(subscriber).unwrap();
 
         let got = rec.notifications_for(sub);
         assert_eq!(got.len(), 1);
@@ -2524,14 +2537,12 @@ mod tests {
     fn e2e_subscribe_key_and_notify_sends_current_value() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        store.table::<Items>(OWNER).insert(1, "one".to_owned());
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        owned.Items.insert(1, "one".to_owned());
         rec.reset();
 
-        let sub = store
-            .table::<Items>(OWNER)
-            .subscribe_key_and_notify(subscriber, 1)
-            .unwrap();
+        let sub = owned.Items.subscribe_key_and_notify(subscriber, 1).unwrap();
 
         // The current value is always delivered as a per-key upsert, even though key 1 is the only
         // key in the table (a live first-insert into an empty table would be a table-level upsert).
@@ -2550,13 +2561,10 @@ mod tests {
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
         // The table is non-empty, but does not contain the key being subscribed to.
-        store.table::<Items>(OWNER).insert(2, "two".to_owned());
+        store.Items.insert(OWNER, 2, "two".to_owned());
         rec.reset();
 
-        let sub = store
-            .table::<Items>(OWNER)
-            .subscribe_key_and_notify(subscriber, 1)
-            .unwrap();
+        let sub = store.Items.subscribe_key_and_notify(subscriber, 1).unwrap();
 
         assert!(rec.notifications_for(sub).is_empty());
         assert_eq!(rec.total_calls(), 0);
@@ -2564,11 +2572,7 @@ mod tests {
 
     fn items_snapshot(store: &KvStore) -> Vec<(u32, String)> {
         let txn = store.begin_ro_transaction(OWNER);
-        let mut items: Vec<_> = txn
-            .table::<Items>()
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
+        let mut items: Vec<_> = txn.Items.iter().map(|(k, v)| (*k, v.clone())).collect();
         items.sort();
         items
     }
@@ -2577,14 +2581,15 @@ mod tests {
     fn e2e_no_subscribers_commits_inserts_and_removes() {
         let (notifier, _rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
+        let owned = store.with_owner(OWNER);
 
-        store.table::<Items>(OWNER).insert(1, "a".to_owned());
-        store.table::<Items>(OWNER).insert(2, "b".to_owned());
-        store.table::<Items>(OWNER).insert(2, "b2".to_owned());
-        store.table::<Items>(OWNER).remove(&1);
+        owned.Items.insert(1, "a".to_owned());
+        owned.Items.insert(2, "b".to_owned());
+        owned.Items.insert(2, "b2".to_owned());
+        owned.Items.remove(&1);
 
         assert_eq!(items_snapshot(&store), vec![(2, "b2".to_owned())]);
-        assert_eq!(store.table::<Items>(OWNER).get(&1), None);
+        assert_eq!(owned.Items.get(&1), None);
     }
 
     #[test]
@@ -2595,7 +2600,7 @@ mod tests {
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.remove(&2);
             t.insert(4, "v4".to_owned());
             t.with_mut(&1, |v| v.push('!'));
@@ -2616,13 +2621,14 @@ mod tests {
     fn e2e_no_subscribers_commits_clear() {
         let (notifier, _rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
+        let owned = store.with_owner(OWNER);
         seed_items(&store, &[1, 2]);
 
         // Clear and re-insert within one transaction, so the commit takes the "clear everything,
         // then restore these keys" path with notification collection turned off.
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.clear();
             t.insert(3, "c".to_owned());
         }
@@ -2630,9 +2636,9 @@ mod tests {
 
         assert_eq!(items_snapshot(&store), vec![(3, "c".to_owned())]);
 
-        store.table::<Items>(OWNER).clear();
+        owned.Items.clear();
         assert!(items_snapshot(&store).is_empty());
-        assert!(store.table::<Items>(OWNER).is_empty());
+        assert!(owned.Items.is_empty());
     }
 
     #[test]
@@ -2641,17 +2647,17 @@ mod tests {
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
         // Only `Items` is watched; `Plain` is committed without collecting notifications.
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            txn.table::<Items>().insert(1, "a".to_owned());
-            txn.table::<Plain>().insert(2, "b".to_owned());
+            txn.Items.insert(1, "a".to_owned());
+            txn.Plain.insert(2, "b".to_owned());
         }
         txn.commit().unwrap();
 
-        assert_eq!(store.table::<Plain>(OWNER).get(&2), Some("b".to_owned()));
+        assert_eq!(store.Plain.get(OWNER, &2), Some("b".to_owned()));
         assert_eq!(
             rec.notifications_for(sub)
                 .iter()
@@ -2665,19 +2671,20 @@ mod tests {
     fn e2e_subscribing_after_unwatched_inserts_sees_per_key_upserts() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
 
         // Committed with no subscribers, so no events are collected for it...
-        store.table::<Items>(OWNER).insert(1, "a".to_owned());
+        owned.Items.insert(1, "a".to_owned());
 
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         // ...but the table is still known to be non-empty, so the next insert is a per-key upsert
         // rather than an empty -> non-empty table upsert.
-        store.table::<Items>(OWNER).insert(2, "b".to_owned());
+        owned.Items.insert(2, "b".to_owned());
         // Likewise, removing the key inserted while unwatched is still a notifiable removal.
-        store.table::<Items>(OWNER).remove(&1);
+        owned.Items.remove(&1);
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -2698,14 +2705,14 @@ mod tests {
         let subscriber = store.register_subscriber(OWNER);
 
         seed_items(&store, &[1, 2]);
-        store.table::<Items>(OWNER).clear();
+        store.Items.clear(OWNER);
 
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         rec.reset();
 
         // The unwatched clear really did empty the table, so this insert is an empty -> non-empty
         // transition.
-        store.table::<Items>(OWNER).insert(3, "c".to_owned());
+        store.Items.insert(OWNER, 3, "c".to_owned());
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -2720,12 +2727,13 @@ mod tests {
     fn e2e_no_singleton_subscribers_commits_value() {
         let (notifier, _rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
+        let owned = store.with_owner(OWNER);
 
-        store.insert::<Count>(OWNER, 7);
-        assert_eq!(store.get::<Count>(OWNER), Some(7));
+        owned.Count.insert(7);
+        assert_eq!(owned.Count.get(), Some(7));
 
-        store.remove::<Count>(OWNER);
-        assert_eq!(store.get::<Count>(OWNER), None);
+        owned.Count.remove();
+        assert_eq!(owned.Count.get(), None);
     }
 
     #[test]
@@ -2733,16 +2741,16 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
+        let sub = store.Count.subscribe(subscriber).unwrap();
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
-        txn.insert::<Count>(1);
-        txn.insert::<Shared>(Arc::new("hello".to_owned()));
+        txn.Count.insert(1);
+        txn.Shared.insert(Arc::new("hello".to_owned()));
         txn.commit().unwrap();
 
         assert_eq!(
-            store.get::<Shared>(OWNER).as_deref(),
+            store.Shared.get(OWNER).as_deref(),
             Some(&"hello".to_owned())
         );
         // Only `Count` is watched, so only its event is delivered.
@@ -2759,13 +2767,14 @@ mod tests {
     fn e2e_subscribing_after_unwatched_singleton_writes_sees_later_updates() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
 
-        store.insert::<Count>(OWNER, 7);
-        let sub = store.subscribe::<Count>(subscriber).unwrap();
+        owned.Count.insert(7);
+        let sub = owned.Count.subscribe(subscriber).unwrap();
         rec.reset();
 
-        store.insert::<Count>(OWNER, 8);
+        owned.Count.insert(8);
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -2781,7 +2790,7 @@ mod tests {
     fn seed_rows(store: &KvStore, rows: &[(u32, &str)]) {
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Rows>();
+            let t = &mut txn.Rows;
             for (k, name) in rows {
                 t.insert(
                     *k,
@@ -2800,33 +2809,31 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
         // The closure only reads through its mutable reference.
-        assert_eq!(store.table::<Items>(OWNER).with_mut(&1, |v| v.len()), Ok(2));
+        assert_eq!(store.Items.with_mut(OWNER, &1, |v| v.len()), Ok(2));
 
         assert!(rec.notifications_for(sub).is_empty());
         // A transaction with nothing to report doesn't reach the notifier at all.
         assert_eq!(rec.total_calls(), 0);
-        assert_eq!(store.table::<Items>(OWNER).get(&1), Some("v1".to_owned()));
+        assert_eq!(store.Items.get(OWNER, &1), Some("v1".to_owned()));
     }
 
     #[test]
     fn e2e_with_mut_writing_same_value_notifies_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1]);
         rec.reset();
 
         // Written to, but with a value equal to the one already there.
-        store
-            .table::<Items>(OWNER)
-            .with_mut(&1, |v| *v = "v1".to_owned())
-            .unwrap();
+        owned.Items.with_mut(&1, |v| *v = "v1".to_owned()).unwrap();
 
         assert!(rec.notifications_for(sub).is_empty());
         assert_eq!(rec.total_calls(), 0);
@@ -2837,14 +2844,11 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1]);
         rec.reset();
 
-        store
-            .table::<Items>(OWNER)
-            .with_mut(&1, |v| v.push('!'))
-            .unwrap();
+        store.Items.with_mut(OWNER, &1, |v| v.push('!')).unwrap();
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -2859,16 +2863,17 @@ mod tests {
     fn e2e_mutate_and_revert_in_one_txn_notifies_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1]);
         rec.reset();
 
         // Only the net effect of a transaction is notifiable, so a change which is undone before
         // the commit is not reported.
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.with_mut(&1, |v| v.push('!'));
             t.with_mut(&1, |v| {
                 v.pop();
@@ -2877,7 +2882,7 @@ mod tests {
         txn.commit().unwrap();
 
         assert!(rec.notifications_for(sub).is_empty());
-        assert_eq!(store.table::<Items>(OWNER).get(&1), Some("v1".to_owned()));
+        assert_eq!(owned.Items.get(&1), Some("v1".to_owned()));
     }
 
     #[test]
@@ -2885,13 +2890,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2, 3]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             // Every row is visited (and so de-indexed and re-indexed), but none is changed.
             assert_eq!(t.iter_mut().count(), 3);
         }
@@ -2905,14 +2910,15 @@ mod tests {
     fn e2e_iter_mut_notifies_only_mutated_keys() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2, 3]);
         rec.reset();
 
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             for (k, v) in t.iter_mut() {
                 if *k == 2 {
                     v.push('!');
@@ -2936,13 +2942,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             let total: usize = t.values_mut().map(|v| v.len()).sum();
             assert_eq!(total, 4);
         }
@@ -2956,14 +2962,15 @@ mod tests {
     fn e2e_no_op_mutation_does_not_mask_other_keys() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.with_mut(&1, |v| v.len());
             t.with_mut(&2, |v| v.push('!'));
         }
@@ -2985,13 +2992,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.with_mut(&1, |v| v.len());
             t.remove(&2);
         }
@@ -3010,15 +3017,16 @@ mod tests {
     fn e2e_no_op_mutation_of_removed_key_notifies_only_remove() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
         // The same key is mutated and then removed; the removal wins.
-        let mut txn = store.begin_transaction(OWNER);
+        let mut txn = owned.begin_transaction();
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.with_mut(&1, |v| v.push('!'));
             t.remove(&1);
         }
@@ -3038,16 +3046,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store
-            .table::<Items>(OWNER)
-            .subscribe_key(subscriber, 1)
-            .unwrap();
+        let sub = store.Items.subscribe_key(subscriber, 1).unwrap();
         seed_items(&store, &[1, 2]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.with_mut(&1, |v| v.len());
             t.with_mut(&2, |v| v.push('!'));
         }
@@ -3061,14 +3066,15 @@ mod tests {
     fn e2e_insert_of_identical_value_still_notifies() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1]);
         rec.reset();
 
         // Precision applies to mutation through a `&mut`, not to writes: an insert is always
         // reported, even if it writes the value which was already there.
-        store.table::<Items>(OWNER).insert(1, "v1".to_owned());
+        owned.Items.insert(1, "v1".to_owned());
 
         assert_eq!(
             rec.notifications_for(sub)
@@ -3084,13 +3090,13 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Items>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Items.subscribe(subscriber).unwrap();
         seed_items(&store, &[1]);
         rec.reset();
 
         let mut txn = store.begin_transaction(OWNER);
         {
-            let mut t = txn.table::<Items>();
+            let t = &mut txn.Items;
             t.clear();
             t.insert(2, "b".to_owned());
             t.with_mut(&2, |v| v.len());
@@ -3112,14 +3118,17 @@ mod tests {
     fn e2e_index_with_mut_without_change_notifies_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Rows>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Rows.subscribe(subscriber).unwrap();
         seed_rows(&store, &[(1, "a"), (2, "b")]);
         rec.reset();
 
         assert_eq!(
-            store
-                .table_by::<index::Rows::name>(OWNER)
+            owned
+                .Rows
+                .indexes()
+                .name
                 .with_mut("a", |k, v| (*k, v.count)),
             Ok((1, 0))
         );
@@ -3133,13 +3142,15 @@ mod tests {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
         let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Rows>(OWNER).subscribe(subscriber).unwrap();
+        let sub = store.Rows.subscribe(subscriber).unwrap();
         seed_rows(&store, &[(1, "a"), (2, "b")]);
         rec.reset();
 
         store
-            .table_by::<index::Rows::name>(OWNER)
-            .with_mut("a", |_, v| v.count += 1)
+            .Rows
+            .indexes()
+            .name
+            .with_mut(OWNER, "a", |_, v| v.count += 1)
             .unwrap();
 
         assert_eq!(
@@ -3161,16 +3172,15 @@ mod tests {
     fn e2e_index_iter_mut_without_mutation_notifies_nothing() {
         let (notifier, rec) = RecordingNotifier::new();
         let store = KvStore::from_notifier(Arc::downgrade(&notifier));
-        let subscriber = store.register_subscriber(OWNER);
-        let sub = store.table::<Rows>(OWNER).subscribe(subscriber).unwrap();
+        let owned = store.with_owner(OWNER);
+        let subscriber = owned.register_subscriber();
+        let sub = owned.Rows.subscribe(subscriber).unwrap();
         seed_rows(&store, &[(1, "a"), (2, "b")]);
         rec.reset();
 
         // Iterating an index takes its mutable references via a different path (`Table::get_mut`)
         // to the one `iter_mut` on a plain table uses.
-        let visited = store
-            .table_by::<index::Rows::name>(OWNER)
-            .with_iter_mut(|it| it.count());
+        let visited = owned.Rows.indexes().name.with_iter_mut(|it| it.count());
         assert_eq!(visited, 2);
 
         assert!(rec.notifications_for(sub).is_empty());

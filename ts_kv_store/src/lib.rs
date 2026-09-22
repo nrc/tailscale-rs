@@ -187,7 +187,7 @@ pub mod storage;
 pub mod transactions;
 
 #[doc(inline)]
-pub use index::KvTableIndex;
+pub use index::{IndexTransaction, KvTableIndex, RoIndexTransaction};
 #[doc(inline)]
 pub use iter::{IndexIterator, TableIterator};
 #[doc(inline)]
@@ -198,7 +198,10 @@ pub use pub_sub::{
 pub use raw::KvTable;
 pub use schema::GeneratedStorage;
 #[doc(inline)]
-pub use transactions::{KvTableRoTransactional, KvTableTransactional, RoTransaction, Transaction};
+pub use transactions::{
+    RoSingletonTransaction, RoTableTransaction, RoTransaction, SingletonTransaction,
+    TableTransaction, Transaction,
+};
 
 /// A key-value store. See the crate docs for details. Its schema is described by `TableStorage`.
 pub struct KvStore<TableStorage: schema::GeneratedStorage> {

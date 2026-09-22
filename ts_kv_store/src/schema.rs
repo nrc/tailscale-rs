@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    Owner,
+    Owner, SingletonTransaction, TableTransaction,
     pub_sub::Subscriptions,
     storage::{Table, VersionedValue},
     transactions::TxnId,
@@ -29,16 +29,25 @@ pub trait SingletonDesc: Sized + 'static {
     /// Get a clone of the value from `storage` if the singleton uses cloning for notification values,
     /// or `()` if not.
     fn get_cloned(storage: &Self::Storage, txn_id: TxnId) -> Option<Self::NotificationValue>;
+
     /// Get a reference to the field storing this singleton in `storage`.
     fn get_ref(storage: &Self::Storage) -> &VersionedValue<Option<Self::Value>>;
+
     /// Get a mutable reference to the field storing this singleton in `storage`.
     fn get_mut(storage: &mut Self::Storage) -> &mut VersionedValue<Option<Self::Value>>;
+
     /// Convert an optional reference to this singleton's value to it's notification value.
     fn notif_value(value: &Option<Self::Value>) -> &Option<Self::NotificationValue>;
+
     /// Create a notification from an event.
     fn make_notification(
         event: crate::SingletonEvent<Self, Self::NotificationValue>,
     ) -> <Self::Storage as GeneratedStorage>::Notification;
+
+    /// Create a transactinal accessor of this singleton, existing within `txn`.
+    fn make_txn_view<'a, 'b>(
+        txn: &'b mut <Self::Storage as GeneratedStorage>::Transaction<'a>,
+    ) -> &'b mut SingletonTransaction<'a, Self::Storage, Self>;
 }
 
 /// Describes tabular key/values in the store.
@@ -68,6 +77,11 @@ pub trait TableDesc: Sized + 'static {
     /// Compare two references to this table's value type, returns `true` if the value type impls
     /// `PartialEq` and the values are equal. **Panics** if `Self::Value` does not impl `PartialEq`.
     fn value_eq(a: &Self::Value, b: &Self::Value) -> bool;
+
+    /// Create a transactinal accessor of this table, existing within `txn`.
+    fn make_txn_view<'a, 'b>(
+        txn: &'b mut <Self::Storage as GeneratedStorage>::Transaction<'a>,
+    ) -> &'b mut TableTransaction<'a, Self::Storage, Self>;
 }
 
 /// Similar to `TableDesc::get_table_mut`, but allows for getting two different tables at one time.
@@ -106,6 +120,19 @@ pub trait Notifiable: TableDesc {
 
     /// Create a value for a notification, possibly by cloning `value`.
     fn clone_value_for_notification(value: &Self::Value) -> Self::NotificationValue;
+}
+
+/// A table with indexes.
+pub trait Indexable: TableDesc {
+    /// The macro-generated struct with a field for each of the table's indexes, for access within
+    /// a transaction, see [`crate::TableTransaction::indexes`].
+    type TransactionIndexes<'guard, 'txn>: From<*mut crate::Transaction<'guard, Self::Storage>>;
+
+    /// The read-only counterpart of [`Self::TransactionIndexes`], see
+    /// [`crate::RoTableTransaction::indexes`].
+    type RoTransactionIndexes<'guard, 'txn>: From<
+        *const crate::RoTransaction<'guard, Self::Storage>,
+    >;
 }
 
 /// Describes a table used as an index.
@@ -179,8 +206,20 @@ impl<K: Hash + Eq, V: Any + Send + Sync> IndexStorage<K, V> for () {
 /// This should be considered a sealed trait and not implemented except by the macros in this module.
 /// Unfortunately it has to be public because of macro visibility hygiene.
 #[doc(hidden)]
-pub trait GeneratedStorage: Default + Send + Sync {
+pub trait GeneratedStorage: Default + Send + Sync + 'static {
+    /// An enum of all notification types.
     type Notification: Clone + Send + 'static;
+    /// The type of transactions for a store.
+    ///
+    /// Will contain a field for each singleton and table.
+    type Transaction<'a>: crate::transactions::SchemaTransaction
+    where
+        Self: 'a;
+    /// A read-only version of `Transaction`.
+    type RoTransaction<'a>: crate::transactions::SchemaTransaction
+    where
+        Self: 'a;
+
     /// Commit a transaction by applying all tables' transaction state to their permanent data.
     ///
     /// This operation must be atomic. I.e., it will only fail without any tables committed, and if it
@@ -194,6 +233,12 @@ pub trait GeneratedStorage: Default + Send + Sync {
 
     /// Delete any uncommitted per-transaction state associated with `txn_id` held in tables.
     fn gc_txn(&mut self, txn_id: TxnId);
+
+    /// Create a schema-specific transaction from a general transaction object.
+    fn make_txn<'a>(store_txn: crate::Transaction<'a, Self>) -> Self::Transaction<'a>;
+
+    /// Create a schema-specific read-only transaction from a general transaction object.
+    fn make_ro_txn<'a>(store_txn: crate::RoTransaction<'a, Self>) -> Self::RoTransaction<'a>;
 }
 
 /// Declare the schema of a key/value store. Generates the store itself with the specified tables and
@@ -321,6 +366,10 @@ macro_rules! store {
                 ) -> <Self::Storage as $crate::schema::GeneratedStorage>::Notification {
                     Notification::$sname(event)
                 }
+
+                fn make_txn_view<'a, 'b>(txn: &'b mut <Self::Storage as $crate::schema::GeneratedStorage>::Transaction<'a>) -> &'b mut $crate::SingletonTransaction<'a, Self::Storage, Self> {
+                    &mut txn.$sname
+                }
             }
         )*)?
         $($(
@@ -342,6 +391,9 @@ macro_rules! store {
                 fn get_table_mut(storage: &mut TableStorage) -> &mut $crate::storage::Table<Self, Self::IndexStorage> {
                     &mut storage.$name
                 }
+                fn make_txn_view<'a, 'b>(txn: &'b mut <Self::Storage as $crate::schema::GeneratedStorage>::Transaction<'a>) -> &'b mut $crate::TableTransaction<'a, Self::Storage, Self> {
+                    &mut txn.$name
+                }
 
                 $crate::value_eq!(Self::Value);
             }
@@ -355,6 +407,11 @@ macro_rules! store {
                 fn clone_value_for_notification(_value: &Self::Value) -> Self::NotificationValue {
                     $crate::notification_clone_value!(_value $(; notify($notif))?)
                 }
+            }
+
+            impl $crate::schema::Indexable for $name {
+                type TransactionIndexes<'guard, 'txn> = index::$name::TransactionIndexes<'guard, 'txn>;
+                type RoTransactionIndexes<'guard, 'txn> = index::$name::RoTransactionIndexes<'guard, 'txn>;
             }
 
             $(
@@ -371,6 +428,9 @@ macro_rules! store {
                     }
                     fn get_table_mut(storage: &mut TableStorage) -> &mut $crate::storage::Table<Self, Self::IndexStorage> {
                         &mut storage.$name.indexes.$field
+                    }
+                    fn make_txn_view<'a, 'b>(_txn: &'b mut <Self::Storage as $crate::schema::GeneratedStorage>::Transaction<'a>) -> &'b mut $crate::TableTransaction<'a, Self::Storage, Self> {
+                        unreachable!()
                     }
 
                     $crate::value_eq!(Self::Value);
@@ -413,6 +473,8 @@ macro_rules! store {
 
         impl $crate::schema::GeneratedStorage for TableStorage {
             type Notification = Notification;
+            type Transaction<'a> = Transaction<'a>;
+            type RoTransaction<'a> = RoTransaction<'a>;
 
             fn commit_txn(&mut self, _txn_id: $crate::transactions::TxnId, _notifications: &mut $crate::Notifications<Notification>, _subscriptions: &$crate::pub_sub::Subscriptions<Self::Notification>) -> $crate::Result<()> {
                 $(
@@ -456,6 +518,14 @@ macro_rules! store {
                     )*
                 )?
             }
+
+            fn make_txn<'a>(store_txn: $crate::Transaction<'a, Self>) -> Self::Transaction<'a> {
+                Transaction::new(store_txn)
+            }
+
+            fn make_ro_txn<'a>(store_txn: $crate::RoTransaction<'a, Self>) -> Self::RoTransaction<'a> {
+                RoTransaction::new(store_txn)
+            }
         }
 
         pub mod index {
@@ -473,11 +543,54 @@ macro_rules! store {
                             pub $field: $crate::storage::Table<$field, ()>,
                         )*
                     }
+
+                    /// Access to the table's indexes within a transaction, with a field for each index.
+                    ///
+                    /// Returned by `TableTransaction::indexes`.
+                    pub struct TransactionIndexes<'guard, 'txn> {
+                        #[doc(hidden)]
+                        pub(in super::super) _txn: core::marker::PhantomData<(&'txn mut (), &'guard ())>,
+                        $(
+                            #[allow(dead_code)]
+                            pub $field: $crate::IndexTransaction<'guard, 'txn, $field>,
+                        )*
+                    }
+
+                    /// Access to the table's indexes within a read-only transaction, with a field
+                    /// for each index.
+                    ///
+                    /// Returned by `RoTableTransaction::indexes`.
+                    pub struct RoTransactionIndexes<'guard, 'txn> {
+                        #[doc(hidden)]
+                        pub(in super::super) _txn: core::marker::PhantomData<(&'txn (), &'guard ())>,
+                        $(
+                            #[allow(dead_code)]
+                            pub $field: $crate::RoIndexTransaction<'guard, 'txn, $field>,
+                        )*
+                    }
                 }
             )*)?
         }
 
         $($(
+            impl<'guard, 'txn> From<*mut $crate::Transaction<'guard, TableStorage>> for index::$name::TransactionIndexes<'guard, 'txn> {
+                fn from(_txn: *mut $crate::Transaction<'guard, TableStorage>) -> Self {
+                    index::$name::TransactionIndexes {
+                        _txn: core::marker::PhantomData,
+                        $($field: unsafe { $crate::IndexTransaction::new(_txn) },)*
+                    }
+                }
+            }
+
+            impl<'guard, 'txn> From<*const $crate::RoTransaction<'guard, TableStorage>> for index::$name::RoTransactionIndexes<'guard, 'txn> {
+                fn from(_txn: *const $crate::RoTransaction<'guard, TableStorage>) -> Self {
+                    index::$name::RoTransactionIndexes {
+                        _txn: core::marker::PhantomData,
+                        $($field: unsafe { $crate::RoIndexTransaction::new(_txn) },)*
+                    }
+                }
+            }
+
             impl index::$name::Storage {
                 $(
                     fn $field(val: &$value_ty) -> impl IntoIterator<Item = $field_ty> {
@@ -539,6 +652,107 @@ macro_rules! store {
             fn deref(&self) -> &Self::Target {
                 &self.0
             }
+        }
+
+        #[allow(non_snake_case)]
+        pub struct Transaction<'a> {
+            // `None` only once the transaction has been committed; dropping a `Some` rolls the
+            // transaction back and releases the store's lock.
+            store_txn: Option<Box<$crate::Transaction<'a, TableStorage>>>,
+
+            $($(#[allow(dead_code)] pub $name: $crate::TableTransaction<'a, TableStorage, $name>,)*)?
+            $($(#[allow(dead_code)] pub $sname: $crate::SingletonTransaction<'a, TableStorage, $sname>,)*)?
+        }
+
+        impl<'a> Transaction<'a> {
+            fn new(store_txn: $crate::Transaction<'a, TableStorage>) -> Self {
+                let mut store_txn = Box::new(store_txn);
+                let raw = store_txn.as_mut() as *mut $crate::Transaction<'a, TableStorage>;
+
+                Transaction {
+                    $($($name: unsafe { $crate::TableTransaction::new(raw) },)*)?
+                    $($($sname: unsafe { $crate::SingletonTransaction::new(raw) },)*)?
+
+                    store_txn: Some(store_txn),
+                }
+            }
+
+            pub fn commit(mut self) -> $crate::Result<()> {
+                // `Self` implements `Drop` (so that the per-table fields cannot be moved out of a
+                // transaction), which means `store_txn` cannot be moved out of `self` either; take
+                // it instead. Dropping `self` afterwards then has nothing left to roll back.
+                let store_txn = self.store_txn.take().expect("a transaction is committed once");
+                store_txn.commit()
+            }
+
+            pub fn rollback(self) {
+                // Dropping `self` causes the rollback.
+            }
+        }
+
+        // Blocks moving the per-table/singleton fields out of the transaction: they hold pointers
+        // back into it, so they must not outlive it. Rolling back an uncommitted transaction is
+        // left to the drop glue for `store_txn`.
+        impl<'a> Drop for Transaction<'a> {
+            fn drop(&mut self) {}
+        }
+
+        impl<'a> $crate::transactions::SchemaTransaction for Transaction<'a> {
+            fn commit(self) -> $crate::Result<()> {
+                self.commit()
+            }
+
+            fn rollback(self) {
+                self.rollback()
+            }
+
+        }
+
+        #[allow(non_snake_case)]
+        pub struct RoTransaction<'a> {
+            _store_txn: Box<$crate::RoTransaction<'a, TableStorage>>,
+
+            $($(#[allow(dead_code)] pub $name: $crate::RoTableTransaction<'a, TableStorage, $name>,)*)?
+            $($(#[allow(dead_code)] pub $sname: $crate::RoSingletonTransaction<'a, TableStorage, $sname>,)*)?
+        }
+
+        impl<'a> RoTransaction<'a> {
+            fn new(store_txn: $crate::RoTransaction<'a, TableStorage>) -> Self {
+                let _store_txn = Box::new(store_txn);
+                let raw = _store_txn.as_ref() as *const $crate::RoTransaction<'a, TableStorage>;
+
+                RoTransaction {
+                    $($($name: unsafe { $crate::RoTableTransaction::new(raw) },)*)?
+                    $($($sname: unsafe { $crate::RoSingletonTransaction::new(raw) },)*)?
+
+                    _store_txn,
+                }
+            }
+
+            pub fn commit(self) -> $crate::Result<()> {
+                Ok(())
+            }
+
+            pub fn rollback(self) {
+                // Dropping `self` causes the rollback.
+            }
+        }
+
+        // Blocks moving the per-table/singleton fields out of the transaction: they hold pointers
+        // back into it, so they must not outlive it.
+        impl<'a> Drop for RoTransaction<'a> {
+            fn drop(&mut self) {}
+        }
+
+        impl<'a> $crate::transactions::SchemaTransaction for RoTransaction<'a> {
+            fn commit(self) -> $crate::Result<()> {
+                self.commit()
+            }
+
+            fn rollback(self) {
+                self.rollback()
+            }
+
         }
     };
 }

@@ -1,14 +1,16 @@
 use std::{
     borrow::Borrow,
     hash::Hash,
+    marker::PhantomData,
     sync::{RwLockReadGuard, RwLockWriteGuard},
 };
 
 use crate::{
     KvStore, Owner, Result, RoTransaction, Transaction,
     operations::{Base, BaseKey, BaseValue, IndexValue, IndexedOps, IndexedOpsMut, Ops, OpsMut},
-    schema::IndexDesc,
+    schema::{IndexDesc, TableDesc},
     storage::Storage,
+    transactions::SchemaTransaction,
 };
 
 /// An abstraction for operating on a table of key/values pairs via an index.
@@ -150,51 +152,75 @@ impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
     }
 }
 
-/// An abstraction for operating on a table of key/values pairs (accessed as part of a transaction) via an index.
+/// An abstraction for operating on a table of key/values pairs (accessed as part of a transaction)
+/// via an index.
 ///
-/// `D` describes the index table.
-/// `B` describes the base table.
+/// The transactional counterpart of [`Index`]: the operations are the same, but they are part of
+/// the transaction this was created from rather than being atomic on their own, and the owner comes
+/// from the transaction.
 ///
-/// SAFETY: `D` and `B` must describe different tables (this is enforced by the macros, but possible
-/// to violate if building a schema by hand).
-pub struct KvTableTransactionalIndex<'guard, 'txn, D: IndexDesc> {
-    pub(crate) txn: &'txn mut Transaction<'guard, D::Storage>,
+/// `D` describes the index table, its base table is `D::BaseTable`.
+///
+/// There is a field of this type for each of a table's indexes in the struct returned by
+/// [`TableTransaction::indexes`](crate::TableTransaction::indexes).
+pub struct IndexTransaction<'guard, 'txn, D: IndexDesc> {
+    /// Invariant: `txn` outlives `self` and `'txn`.
+    txn: *mut Transaction<'guard, D::Storage>,
+    desc: PhantomData<&'txn mut D>,
 }
 
-impl<'guard, 'txn, 'a, D: IndexDesc> Ops<D::Storage>
-    for &'a KvTableTransactionalIndex<'guard, 'txn, D>
-{
+impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
+    /// SAFETY: the caller must ensure that the target of `txn` will outlive `self` and `'txn`.
+    #[doc(hidden)]
+    pub unsafe fn new(txn: *mut Transaction<'guard, D::Storage>) -> Self {
+        IndexTransaction {
+            txn,
+            desc: PhantomData,
+        }
+    }
+
+    fn owner(&self) -> Owner {
+        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant), and
+        // `owner` has `'static` lifetime.
+        unsafe { (*self.txn).owner }
+    }
+}
+
+impl<'guard, 'txn, 'a, D: IndexDesc> Ops<D::Storage> for &'a IndexTransaction<'guard, 'txn, D> {
     type ReadLock = &'a RwLockWriteGuard<'guard, Storage<D::Storage>>;
 
     fn read_lock(self) -> Self::ReadLock {
-        self.txn.guard.as_ref().unwrap()
+        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant),
+        // and the returned lock is a reference lifetime with lifetime `'a`.
+        unsafe { (*self.txn).guard.as_ref().unwrap() }
     }
 }
 
 impl<'guard, 'txn, 'a, D: IndexDesc> OpsMut<D::Storage>
-    for &'a mut KvTableTransactionalIndex<'guard, 'txn, D>
+    for &'a mut IndexTransaction<'guard, 'txn, D>
 {
     type WriteLock = &'a mut RwLockWriteGuard<'guard, Storage<D::Storage>>;
 
     fn write_lock(self) -> Self::WriteLock {
-        self.txn.guard.as_mut().unwrap()
+        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant),
+        // and the returned lock is a reference lifetime with lifetime `'a`.
+        unsafe { (*self.txn).guard.as_mut().unwrap() }
     }
 }
 
-impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage>
-    for &KvTableTransactionalIndex<'guard, 'txn, D>
-{
+impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage> for &IndexTransaction<'guard, 'txn, D> {
     type IndexDesc = D;
 }
 
 // SAFETY: by the safety invariant of `IndexDesc`.
 unsafe impl<'guard, 'txn, D: IndexDesc> IndexedOpsMut<D::Storage>
-    for &mut KvTableTransactionalIndex<'guard, 'txn, D>
+    for &mut IndexTransaction<'guard, 'txn, D>
 {
     type IndexDesc = D;
 }
 
-impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
+impl<'guard, 'txn, D: IndexDesc> IndexTransaction<'guard, 'txn, D> {
+    /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
         <&Self as IndexedOps<_>>::check_consistent(self)
     }
@@ -210,7 +236,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::get::<Q>(self, key, self.txn.owner)
+        <&Self as IndexedOps<_>>::get::<Q>(self, key, self.owner())
     }
 
     /// Get immutable access to a row of the table in the store by reference.
@@ -222,7 +248,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.txn.owner)
+        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.owner())
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -240,7 +266,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         BaseValue<D>: Clone + PartialEq,
         IndexValue<D>: Eq + Hash,
     {
-        <&mut Self as IndexedOpsMut<_>>::with_mut::<Q, T>(self, key, f, self.txn.owner)
+        <&mut Self as IndexedOpsMut<_>>::with_mut::<Q, T>(self, key, f, self.owner())
     }
 
     /// Remove a row from the table.
@@ -250,7 +276,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
         IndexValue<D>: Eq + Hash + ToOwned<Owned = BaseKey<D>>,
     {
-        <&mut Self as IndexedOpsMut<_>>::remove::<Q>(self, key, self.txn.owner)
+        <&mut Self as IndexedOpsMut<_>>::remove::<Q>(self, key, self.owner())
     }
 
     /// Iterate all the keys in the index and value in the base table.
@@ -260,7 +286,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         Base<D>: 'guard,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::iter(self, self.txn.owner)
+        <&Self as IndexedOps<_>>::iter(self, self.owner())
     }
 
     /// Iterate all the keys in the index.
@@ -269,7 +295,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         D: 'guard,
         Base<D>: 'guard,
     {
-        <&Self as IndexedOps<_>>::keys(self, self.txn.owner)
+        <&Self as IndexedOps<_>>::keys(self, self.owner())
     }
 
     /// Iterate all the key/value pairs in a table.
@@ -278,39 +304,59 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         IndexValue<D>: Eq + Hash + Clone,
         BaseValue<D>: Clone + PartialEq,
     {
-        let owner = self.txn.owner;
+        let owner = self.owner();
         IndexedOpsMut::iter_mut(self, owner)
     }
 }
 
-/// An abstraction for operating on a table of key/values pairs (accessed as part of a transaction) via an index.
+/// An abstraction for operating on a table of key/values pairs (accessed as part of a read-only
+/// transaction) via an index.
 ///
-/// `D` describes the index table.
-/// `B` describes the base table.
+/// The read-only counterpart of [`IndexTransaction`], with only the non-mutating operations.
 ///
-/// SAFETY: `D` and `B` must describe different tables (this is enforced by the macros, but possible
-/// to violate if building a schema by hand).
-pub struct KvTableRoTransactionalIndex<'guard, 'txn, D: IndexDesc> {
-    pub(crate) txn: &'txn RoTransaction<'guard, D::Storage>,
+/// `D` describes the index table, its base table is `D::BaseTable`.
+///
+/// There is a field of this type for each of a table's indexes in the struct returned by
+/// [`RoTableTransaction::indexes`](crate::RoTableTransaction::indexes).
+pub struct RoIndexTransaction<'guard, 'txn, D: IndexDesc> {
+    /// Invariant: `txn` outlives `self` and `'txn`.
+    txn: *const RoTransaction<'guard, D::Storage>,
+    desc: PhantomData<&'txn D>,
 }
 
-impl<'guard, 'txn, 'a, D: IndexDesc> Ops<D::Storage>
-    for &'a KvTableRoTransactionalIndex<'guard, 'txn, D>
-{
-    type ReadLock = &'a RwLockReadGuard<'guard, Storage<D::Storage>>;
+impl<'guard, 'txn, D: IndexDesc> RoIndexTransaction<'guard, 'txn, D> {
+    /// SAFETY: the caller must ensure that the target of `txn` will outlive `self` and `'txn`.
+    #[doc(hidden)]
+    pub unsafe fn new(txn: *const RoTransaction<'guard, D::Storage>) -> Self {
+        RoIndexTransaction {
+            txn,
+            desc: PhantomData,
+        }
+    }
 
-    fn read_lock(self) -> Self::ReadLock {
-        &self.txn.guard
+    fn owner(&self) -> Owner {
+        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant), and
+        // `owner` has `'static` lifetime.
+        unsafe { (*self.txn).owner }
     }
 }
 
-impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage>
-    for &KvTableRoTransactionalIndex<'guard, 'txn, D>
-{
+impl<'guard, 'txn, 'a, D: IndexDesc> Ops<D::Storage> for &'a RoIndexTransaction<'guard, 'txn, D> {
+    type ReadLock = &'a RwLockReadGuard<'guard, Storage<D::Storage>>;
+
+    fn read_lock(self) -> Self::ReadLock {
+        // SAFETY: safe since `self.txn` must be live since `self` is (by it's field invariant),
+        // and the returned lock is a reference lifetime with lifetime `'a`.
+        unsafe { &(*self.txn).guard }
+    }
+}
+
+impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage> for &RoIndexTransaction<'guard, 'txn, D> {
     type IndexDesc = D;
 }
 
-impl<'guard, 'txn, D: IndexDesc> KvTableRoTransactionalIndex<'guard, 'txn, D> {
+impl<'guard, 'txn, D: IndexDesc> RoIndexTransaction<'guard, 'txn, D> {
+    /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
         <&Self as IndexedOps<_>>::check_consistent(self)
     }
@@ -326,7 +372,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableRoTransactionalIndex<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::get::<Q>(self, key, self.txn.owner)
+        <&Self as IndexedOps<_>>::get::<Q>(self, key, self.owner())
     }
 
     /// Get immutable access to a row of the table in the store by reference.
@@ -338,7 +384,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableRoTransactionalIndex<'guard, 'txn, D> {
         Q: ?Sized + Hash + Eq,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.txn.owner)
+        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.owner())
     }
 
     /// Iterate all the keys in the index and value in the base table.
@@ -347,7 +393,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableRoTransactionalIndex<'guard, 'txn, D> {
         D: 'guard,
         IndexValue<D>: Eq + Hash,
     {
-        <&Self as IndexedOps<_>>::iter(self, self.txn.owner)
+        <&Self as IndexedOps<_>>::iter(self, self.owner())
     }
 
     /// Iterate all the keys in the index.
@@ -355,7 +401,7 @@ impl<'guard, 'txn, D: IndexDesc> KvTableRoTransactionalIndex<'guard, 'txn, D> {
     where
         D: 'guard,
     {
-        <&Self as IndexedOps<_>>::keys(self, self.txn.owner)
+        <&Self as IndexedOps<_>>::keys(self, self.owner())
     }
 }
 

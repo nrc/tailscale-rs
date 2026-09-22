@@ -8,27 +8,30 @@
 //! # use ts_kv_store::{Owner, store};
 //! # const OWNER: Owner = "owner";
 //! store!(
-//!     kvs: { foo(u64; OWNER) }
+//!     kvs: { Foo(u64; OWNER) }
 //!     tables: { Nodes(u32 => String; OWNER) }
 //! );
 //!
 //! pub fn main() {
 //!     let store = KvStore::new();
 //!
-//!     store.insert::<foo>(OWNER, 42);
+//!     // Each singleton and table in the schema is a field of the store, and every operation on
+//!     // one takes the owner of the data it touches.
+//!     store.Foo.insert(OWNER, 42);
 //!
-//!     let nodes = store.table::<Nodes>(OWNER);
-//!     nodes.insert(4, "a".to_owned());
-//!     nodes.insert(0, "b".to_owned());
-//!     nodes.insert(10, "c".to_owned());
-//!     nodes.insert(400, "d".to_owned());
+//!     // A `with_owner` view of the store supplies that owner once, rather than on every call.
+//!     let owned = store.with_owner(OWNER);
+//!     owned.Nodes.insert(4, "a".to_owned());
+//!     owned.Nodes.insert(0, "b".to_owned());
+//!     owned.Nodes.insert(10, "c".to_owned());
+//!     owned.Nodes.insert(400, "d".to_owned());
 //!
-//!     assert_eq!(nodes.len(), 4);
+//!     assert_eq!(owned.Nodes.len(), 4);
 //!
 //!     println!(
 //!         "singleton: {}, row 4: {}",
-//!         store.get::<foo>(OWNER).unwrap(),
-//!         nodes.get(&4).unwrap(),
+//!         owned.Foo.get().unwrap(),
+//!         owned.Nodes.get(&4).unwrap(),
 //!     );
 //! }
 //! ```
@@ -37,13 +40,11 @@
 //!
 //! There are two broad kinds of data which can be stored in a KV store: singleton data and tabular
 //! data. The former are simple key/value pairs, the latter are tables of data where a key identifies
-//! a row in the table. Due to implementation details there are some differences in the APIs for each
-//! kind of data, but they have roughly the same operations available.
+//! a row in the table. They have roughly the same operations available.
 //!
 //! The store is strongly typed. Both singletons and tables must be statically declared and both keys
-//! and values have types from these declarations. Macros for these declarations are in the [`schema`]
-//! module. They expand into an empty type for each singleton or table, and trait impls for these
-//! types. The types are then used as type parameters for all operations.
+//! and values have types from these declarations. A store is declared using the `store` macro in the [`schema`]
+//! module. `store!` expands a store object and objects for each singleton and table.
 //!
 //! Each singleton KV pair has its own types. A table has a single key type and single value type
 //! for all rows in the table.
@@ -51,9 +52,7 @@
 //! The data store has raw and transactional APIs. The raw API guarantees that each operation is
 //! atomic, but has no guarantees across multiple operatons. The transactional API groups operations
 //! into transactions which are atomic and serializable. Both singleton and tabular data can be part
-//! of a transaction. The `Table` types used for accessing tabular data do not add any transactional
-//! elements. That is, operations on a `Table` created from the main store are not part of a transaction,
-//! and operations on a `Table` created from a transaction are only part of that transaction.
+//! of a transaction.
 //!
 //! Transactions may be read/write or read-only. Transactions can be committed or rolled-back, if a
 //! transaction is dropped without being committed, then it is rolled-back. The system should handle
@@ -71,13 +70,13 @@
 //!
 //! For example, consider a table `Base` which maps `u64` keys to `Foo` values where `Foo` has a
 //! field `bar: Url` (and `bar` is a unique identifier for a `Foo` in `Base`). The schema would look
-//! like `tables!(Base(u64 => Foo; OWNER; index(bar: Url)));` which will create a `Base` table and an
-//! `index::Base::bar` table. By using `store.table_by::<index::Base::bar>(...)` the `Base` table
-//! can be accessed as if it were a table mapping `Url`s to `Foo`s. The index is maintained whenever
+//! like `store!(tables: { Base(u64 => Foo; OWNER; index(bar: Url)) });` which will create a `Base`
+//! table and an `index::Base::bar` table. By using `store.Base.indexes().bar` the `Base` table can
+//! be accessed somewhat like a table mapping `Url`s to `Foo`s. The index is maintained whenever
 //! `Base` is modified (directly or via any index) by using the `bar` field of the values in `Base`.
 //!
-//! The index table can be accessed directly like a normal table (`Url`), but I don't recommend it.
-//! The key type is `Url` and the value type is `u64`.
+//! The index table is itself stored as a table (inside the base tables `indexes` field) with key
+//! type `Url` and value type `u64`.
 //!
 //! Index fields must uniquely identify a row in the base table. If multiple rows in the base table
 //! have the same key in the index, then either a panic is triggered, or accessing or committing a
@@ -128,17 +127,20 @@
 //! Part of the work of the macros is to generate an internal storage struct. To ensure an ergonomic
 //! API, the generic [`KvStore`] is wrapped in a local `KvStore` which can be deref-ed to the inner,
 //! generic type. Users of the library should only use the generated type, but see the generic type
-//! for documentation.
+//! for documentation. The generated store has a field for each singleton and table. A convenience
+//! wrapper holding a store and owner is also generated.
 //!
-//! The implementation of storage for tabular data is one HashMap per table, and otherwise
-//! straightforward. For singleton data, we store values in an `Option` in fields with the name of
+//! The macros also create transaction types for each singleton and table.
+//!
+//! The implementation of storage for tabular data is one HashMap per table (plus several helper data
+//! structures). For singleton data, we store values in an `Option` in fields with the name of
 //! the singleton.
 //!
 //! The implementation of the storage operations (`get`, `insert`, etc.) is somewhat shared between
-//! the various types which support them (`KvStore`, the table types, the transaction types, index
-//! types, and transactional index types). These are implemented on traits in the `operations` module.
-//! For ease of use and documentation, the functions are implemented on each concrete type and
-//! delegated to the trait implementations. I.e., the traits and impls are an implementation detail.
+//! the various types which support them (singleton, table, index, and transaction types). These are
+//! implemented on traits in the `operations` module. For ease of use and documentation, the functions
+//! are implemented on each concrete type and delegated to the trait implementations. I.e., the traits
+//! and impls are an implementation detail.
 //!
 //! Transactions have an internal id (`TxnId`). Since we use a global lock to ensure serializability,
 //! transactions are only used to ensure atomicity. There can only ever be one (mutating) transaction
@@ -187,7 +189,7 @@ pub mod storage;
 pub mod transactions;
 
 #[doc(inline)]
-pub use index::{IndexTransaction, KvTableIndex, RoIndexTransaction};
+pub use index::{Index, IndexTransaction, IndexWithOwner, RoIndexTransaction};
 #[doc(inline)]
 pub use iter::{IndexIterator, TableIterator};
 #[doc(inline)]
@@ -195,7 +197,7 @@ pub use pub_sub::{
     Event, NoOpNotifier, Notifications, Notifier, SingletonEvent, Subscriber, Subscription,
 };
 #[doc(inline)]
-pub use raw::KvTable;
+pub use raw::{Singleton, SingletonWithOwner, Table, TableWithOwner};
 pub use schema::GeneratedStorage;
 #[doc(inline)]
 pub use transactions::{
@@ -224,11 +226,6 @@ impl<TableStorage: schema::GeneratedStorage> KvStore<TableStorage> {
         Self::new_with_storage(RwLock::new(storage::Storage::new(notifier)))
     }
 
-    /// A convenience for operating on a KV store with a specified owner.
-    pub fn with_owner(&self, owner: Owner) -> StoreWithOwner<'_, TableStorage> {
-        StoreWithOwner { store: self, owner }
-    }
-
     /// Register a new subscriber (with the specified `Owner`) to the store.
     ///
     /// Does not create any subscriptions.
@@ -249,6 +246,24 @@ impl<TableStorage: schema::GeneratedStorage> KvStore<TableStorage> {
         self.get_read_lock()
             .subscriptions
             .remove_subscriber(subscriber)
+    }
+
+    /// Subscribe to the whole store.
+    pub fn subscribe_global(
+        &self,
+        subscriber: impl Into<crate::Subscriber>,
+    ) -> Result<crate::Subscription> {
+        let subs = &self.get_read_lock().subscriptions;
+        let id = subs.create_global_subscription(subscriber.into())?;
+
+        Ok(id)
+    }
+
+    /// Remove any subscriptions to the whole store.
+    pub fn unsubscribe_global(&self, subscription: crate::Subscription) {
+        self.get_read_lock()
+            .subscriptions
+            .remove_global_subscription(subscription);
     }
 
     /// Might (theoretically) panic, see the note on [`clear_lock_poison`].
@@ -289,15 +304,6 @@ impl<TableStorage: schema::GeneratedStorage> KvStore<TableStorage> {
             lock.clear_transaction();
         }
     }
-}
-
-/// A reference to a store for a specified owner.
-///
-/// A convenience wrapper to avoid specifying an owner on every operation.
-#[derive(Clone)]
-pub struct StoreWithOwner<'a, TableStorage: schema::GeneratedStorage> {
-    store: &'a KvStore<TableStorage>,
-    owner: Owner,
 }
 
 /// A token indicating ownership of a KV singleton or table. See crate docs for what ownership means

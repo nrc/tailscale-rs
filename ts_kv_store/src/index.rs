@@ -13,34 +13,201 @@ use crate::{
     transactions::SchemaTransaction,
 };
 
-/// An abstraction for operating on a table of key/values pairs via an index.
+/// Apply `f` to `D`'s view of a transaction which contains only that operation, and commit it.
 ///
-/// `KvTableIndex` has no transactional semantics and only exists as a convenience for accessing
-/// tabular data.
-///
-/// `D` describes the index table.
-/// `B` describes the base table.
-///
-/// SAFETY: `D` and `B` must describe different tables (this is enforced by the macros, but possible
-/// to violate if building a schema by hand).
-pub struct KvTableIndex<'store, D: IndexDesc> {
-    pub(crate) store: &'store KvStore<D::Storage>,
-    pub(crate) owner: Owner,
+/// Returns the error from committing, if there is one. This is how the non-transactional index
+/// operations get their atomicity: each one is a single-operation transaction.
+fn in_index_txn<'store, D, T: 'store>(
+    store: &'store KvStore<D::Storage>,
+    owner: Owner,
+    f: impl FnOnce(&mut IndexTransaction<'_, 'store, D>) -> T,
+) -> Result<T>
+where
+    D: IndexDesc,
+{
+    let mut txn = store.begin_transaction(owner);
+    let result = {
+        // An index has no field of its own in the generated transaction, so we reach the underlying
+        // transaction via the base table's view of it.
+        let store_txn = <D::BaseTable as TableDesc>::make_txn_view(&mut txn).store_txn();
+        // SAFETY: `store_txn` outlives `txn` by the signature of `make_txn_view`, which outlives `'store` by the signature of
+        // `KvStore::begin_transaction`. The `'store` bound on `T` ensures the result of `f` cannot outlive `store`.
+        f(&mut unsafe { IndexTransaction::new(store_txn) })
+    };
+    txn.commit()?;
+    Ok(result)
 }
 
-impl<'idx, D: IndexDesc> Ops<D::Storage> for &'idx KvTableIndex<'_, D> {
-    type ReadLock = std::sync::RwLockReadGuard<'idx, Storage<D::Storage>>;
+/// An abstraction for operating on a table of key/values pairs via an index.
+///
+/// `Index` has no transactional semantics and only exists as a convenience for accessing tabular
+/// data; each mutating operation is its own single-operation transaction.
+///
+/// `D` describes the index table, its base table is `D::BaseTable`.
+///
+/// There is a field of this type for each of a table's indexes in the struct returned by
+/// [`Table::indexes`](crate::Table::indexes).
+pub struct Index<'store, D: IndexDesc> {
+    store: &'store KvStore<D::Storage>,
+    desc: PhantomData<D>,
+}
+
+impl<'store, D: IndexDesc> Index<'store, D> {
+    /// Create an index accessor for `store`.
+    #[doc(hidden)]
+    pub fn new(store: &'store KvStore<D::Storage>) -> Self {
+        Index {
+            store,
+            desc: PhantomData,
+        }
+    }
+
+    /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
+    pub fn check_consistent(&self) -> Result<()> {
+        <&Self as IndexedOps<_>>::check_consistent(self)
+    }
+
+    /// Get a row of the table from the store by cloning the value.
+    ///
+    /// Returns `Error::NotPresent` if there is no value for the specified key.
+    pub fn get<Q>(&self, owner: Owner, key: &Q) -> Result<(BaseKey<D>, BaseValue<D>)>
+    where
+        BaseKey<D>: Clone,
+        BaseValue<D>: Clone,
+        D::Key: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+        IndexValue<D>: Eq + Hash,
+    {
+        <&Self as IndexedOps<_>>::get(self, key, owner)
+    }
+
+    /// Get immutable access to a row of the table in the store by reference.
+    ///
+    /// Returns `Error::NotPresent` (and does not call `f`) if there is no value for the specified key.
+    pub fn with<Q, T>(
+        &self,
+        owner: Owner,
+        key: &Q,
+        f: impl FnOnce(&BaseKey<D>, &BaseValue<D>) -> T,
+    ) -> Result<T>
+    where
+        D::Key: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+        IndexValue<D>: Eq + Hash,
+    {
+        <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, owner)
+    }
+
+    /// Get mutable access to a row of the table in the store in the store.
+    ///
+    /// Returns `Error::NotPresent` (and does not call `f`) if there is no value for the specified key.
+    pub fn with_mut<Q, T>(
+        &self,
+        owner: Owner,
+        key: &Q,
+        f: impl FnOnce(&BaseKey<D>, &mut BaseValue<D>) -> T,
+    ) -> Result<T>
+    where
+        D::Key: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+        BaseKey<D>: Clone,
+        BaseValue<D>: Clone + PartialEq,
+        IndexValue<D>: Eq + Hash,
+    {
+        in_index_txn::<D, _>(self.store, owner, |view| {
+            IndexedOpsMut::with_mut(view, key, f, owner)
+        })?
+    }
+
+    /// Remove a row from the table.
+    pub fn remove<Q>(&self, owner: Owner, key: &Q)
+    where
+        D::Key: Borrow<Q>,
+        Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
+        IndexValue<D>: Eq + Hash + ToOwned<Owned = BaseKey<D>>,
+    {
+        // Should never panic since transaction should only fail on index inserts.
+        in_index_txn::<D, _>(self.store, owner, |view| {
+            IndexedOpsMut::remove(view, key, owner)
+        })
+        .unwrap()
+    }
+
+    /// Iterate all the keys in the index and value in the base table.
+    pub fn iter(
+        &self,
+        owner: Owner,
+    ) -> impl Iterator<Item = (&'store D::Key, &'store BaseKey<D>, &'store BaseValue<D>)>
+    where
+        IndexValue<D>: Eq + Hash,
+    {
+        <&Self as IndexedOps<_>>::iter(self, owner)
+    }
+
+    /// Iterate all the keys in the index.
+    pub fn keys(&self, owner: Owner) -> impl Iterator<Item = &'store D::Key>
+    where
+        IndexValue<D>: Eq + Hash,
+    {
+        <&Self as IndexedOps<_>>::keys(self, owner)
+    }
+
+    /// Iterate all the key/value pairs in a table.
+    ///
+    /// If you need a mutable iterator without access scoped by a closure, use `iter_mut` within a
+    /// transaction.
+    pub fn with_iter_mut<F, T>(&self, owner: Owner, mut f: F) -> T
+    where
+        F: for<'a> FnMut(
+            &mut dyn Iterator<Item = (&D::Key, &'a BaseKey<D>, &'a mut BaseValue<D>)>,
+        ) -> T,
+        IndexValue<D>: Eq + Hash + Clone,
+        BaseValue<D>: Clone + PartialEq,
+    {
+        // Should never panic since transaction should only fail on index inserts.
+        in_index_txn::<D, _>(self.store, owner, |view| {
+            let mut iter = IndexedOpsMut::iter_mut(view, owner);
+            f(&mut iter)
+        })
+        .unwrap()
+    }
+}
+
+impl<'store, D: IndexDesc> Ops<D::Storage> for &Index<'store, D> {
+    type ReadLock = RwLockReadGuard<'store, Storage<D::Storage>>;
 
     fn read_lock(self) -> Self::ReadLock {
         self.store.get_read_lock()
     }
 }
 
-impl<D: IndexDesc> IndexedOps<D::Storage> for &KvTableIndex<'_, D> {
+impl<D: IndexDesc> IndexedOps<D::Storage> for &Index<'_, D> {
     type IndexDesc = D;
 }
 
-impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
+/// An abstraction for operating on a table of key/values pairs via an index, with a fixed owner.
+///
+/// The owner-carrying counterpart of [`Index`]: the operations are the same, but the owner is
+/// supplied once (by [`TableWithOwner::indexes`](crate::TableWithOwner::indexes)) rather than on
+/// each call.
+///
+/// `D` describes the index table, its base table is `D::BaseTable`.
+pub struct IndexWithOwner<'store, D: IndexDesc> {
+    store: &'store KvStore<D::Storage>,
+    owner: Owner,
+    desc: PhantomData<D>,
+}
+
+impl<'store, D: IndexDesc> IndexWithOwner<'store, D> {
+    #[doc(hidden)]
+    pub fn new(store: &'store KvStore<D::Storage>, owner: Owner) -> Self {
+        IndexWithOwner {
+            store,
+            owner,
+            desc: PhantomData,
+        }
+    }
+
     /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
         <&Self as IndexedOps<_>>::check_consistent(self)
@@ -87,11 +254,9 @@ impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
         BaseValue<D>: Clone + PartialEq,
         IndexValue<D>: Eq + Hash,
     {
-        let mut txn = self.store.begin_transaction(self.owner);
-        let mut txn_table = KvTableTransactionalIndex::<D> { txn: &mut txn };
-        let result = IndexedOpsMut::with_mut(&mut txn_table, key, f, self.owner);
-        txn.commit()?;
-        result
+        in_index_txn::<D, _>(self.store, self.owner, |view| {
+            IndexedOpsMut::with_mut(view, key, f, self.owner)
+        })?
     }
 
     /// Remove a row from the table.
@@ -101,28 +266,26 @@ impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
         IndexValue<D>: Eq + Hash + ToOwned<Owned = BaseKey<D>>,
     {
-        let mut txn = self.store.begin_transaction(self.owner);
-        let mut txn_table = KvTableTransactionalIndex::<D> { txn: &mut txn };
-        IndexedOpsMut::remove(&mut txn_table, key, self.owner);
         // Should never panic since transaction should only fail on index inserts.
-        txn.commit().unwrap();
+        in_index_txn::<D, _>(self.store, self.owner, |view| {
+            IndexedOpsMut::remove(view, key, self.owner)
+        })
+        .unwrap()
     }
 
     /// Iterate all the keys in the index and value in the base table.
-    pub fn iter(&self) -> impl Iterator<Item = (&D::Key, &BaseKey<D>, &BaseValue<D>)>
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&'store D::Key, &'store BaseKey<D>, &'store BaseValue<D>)>
     where
-        D: 'store,
-        Base<D>: 'store,
         IndexValue<D>: Eq + Hash,
     {
         <&Self as IndexedOps<_>>::iter(self, self.owner)
     }
 
     /// Iterate all the keys in the index.
-    pub fn keys(&self) -> impl Iterator<Item = &D::Key>
+    pub fn keys(&self) -> impl Iterator<Item = &'store D::Key>
     where
-        D: 'store,
-        Base<D>: 'store,
         IndexValue<D>: Eq + Hash,
     {
         <&Self as IndexedOps<_>>::keys(self, self.owner)
@@ -140,16 +303,25 @@ impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
         IndexValue<D>: Eq + Hash + Clone,
         BaseValue<D>: Clone + PartialEq,
     {
-        let mut txn = self.store.begin_transaction(self.owner);
-        let mut txn_table = KvTableTransactionalIndex::<D> { txn: &mut txn };
-        let result = {
-            let mut iter = IndexedOpsMut::iter_mut(&mut txn_table, self.owner);
-            f(&mut iter)
-        };
         // Should never panic since transaction should only fail on index inserts.
-        txn.commit().unwrap();
-        result
+        in_index_txn::<D, _>(self.store, self.owner, |view| {
+            let mut iter = IndexedOpsMut::iter_mut(view, self.owner);
+            f(&mut iter)
+        })
+        .unwrap()
     }
+}
+
+impl<'store, D: IndexDesc> Ops<D::Storage> for &IndexWithOwner<'store, D> {
+    type ReadLock = RwLockReadGuard<'store, Storage<D::Storage>>;
+
+    fn read_lock(self) -> Self::ReadLock {
+        self.store.get_read_lock()
+    }
+}
+
+impl<D: IndexDesc> IndexedOps<D::Storage> for &IndexWithOwner<'_, D> {
+    type IndexDesc = D;
 }
 
 /// An abstraction for operating on a table of key/values pairs (accessed as part of a transaction)

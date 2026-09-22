@@ -124,11 +124,19 @@ pub trait Notifiable: TableDesc {
 
 /// A table with indexes.
 pub trait Indexable: TableDesc {
-    /// The macro-generated struct with a field for each of the table's indexes, for access within
-    /// a transaction, see [`crate::TableTransaction::indexes`].
+    /// The macro-generated struct with a field for each of the table's indexes, see
+    /// [`crate::Table::indexes`].
+    type Indexes<'store>: From<&'store crate::KvStore<Self::Storage>>;
+
+    /// The owner-carrying counterpart of [`Self::Indexes`], see
+    /// [`crate::TableWithOwner::indexes`].
+    type IndexesWithOwner<'store>: From<(&'store crate::KvStore<Self::Storage>, Owner)>;
+
+    /// The transactional counterpart of [`Self::Indexes`], see
+    /// [`crate::TableTransaction::indexes`].
     type TransactionIndexes<'guard, 'txn>: From<*mut crate::Transaction<'guard, Self::Storage>>;
 
-    /// The read-only counterpart of [`Self::TransactionIndexes`], see
+    /// The read-only transactional counterpart of [`Self::Indexes`], see
     /// [`crate::RoTableTransaction::indexes`].
     type RoTransactionIndexes<'guard, 'txn>: From<
         *const crate::RoTransaction<'guard, Self::Storage>,
@@ -410,6 +418,8 @@ macro_rules! store {
             }
 
             impl $crate::schema::Indexable for $name {
+                type Indexes<'store> = index::$name::Indexes<'store>;
+                type IndexesWithOwner<'store> = index::$name::IndexesWithOwner<'store>;
                 type TransactionIndexes<'guard, 'txn> = index::$name::TransactionIndexes<'guard, 'txn>;
                 type RoTransactionIndexes<'guard, 'txn> = index::$name::RoTransactionIndexes<'guard, 'txn>;
             }
@@ -537,10 +547,36 @@ macro_rules! store {
                         pub struct $field;
                     )*
 
+                    /// Storage for the table's indexes.
                     #[derive(Default)]
                     pub struct Storage {
                         $(
+                            #[allow(dead_code)]
                             pub $field: $crate::storage::Table<$field, ()>,
+                        )*
+                    }
+
+                    /// Access to the table's indexes, with a field for each index.
+                    ///
+                    /// Returned by `Table::indexes`.
+                    pub struct Indexes<'store> {
+                        #[doc(hidden)]
+                        pub(in super::super) _store: core::marker::PhantomData<&'store ()>,
+                        $(
+                            #[allow(dead_code)]
+                            pub $field: $crate::Index<'store, $field>,
+                        )*
+                    }
+
+                    /// Access to the table's indexes with a fixed owner, with a field for each index.
+                    ///
+                    /// Returned by `TableWithOwner::indexes`.
+                    pub struct IndexesWithOwner<'store> {
+                        #[doc(hidden)]
+                        pub(in super::super) _store: core::marker::PhantomData<&'store ()>,
+                        $(
+                            #[allow(dead_code)]
+                            pub $field: $crate::IndexWithOwner<'store, $field>,
                         )*
                     }
 
@@ -573,6 +609,24 @@ macro_rules! store {
         }
 
         $($(
+            impl<'store> From<&'store $crate::KvStore<TableStorage>> for index::$name::Indexes<'store> {
+                fn from(_store: &'store $crate::KvStore<TableStorage>) -> Self {
+                    index::$name::Indexes {
+                        _store: core::marker::PhantomData,
+                        $($field: $crate::Index::new(_store),)*
+                    }
+                }
+            }
+
+            impl<'store> From<(&'store $crate::KvStore<TableStorage>, $crate::Owner)> for index::$name::IndexesWithOwner<'store> {
+                fn from((_store, _owner): (&'store $crate::KvStore<TableStorage>, $crate::Owner)) -> Self {
+                    index::$name::IndexesWithOwner {
+                        _store: core::marker::PhantomData,
+                        $($field: $crate::IndexWithOwner::new(_store, _owner),)*
+                    }
+                }
+            }
+
             impl<'guard, 'txn> From<*mut $crate::Transaction<'guard, TableStorage>> for index::$name::TransactionIndexes<'guard, 'txn> {
                 fn from(_txn: *mut $crate::Transaction<'guard, TableStorage>) -> Self {
                     index::$name::TransactionIndexes {
@@ -621,7 +675,13 @@ macro_rules! store {
         /// A key-value store.
         ///
         /// See [`$crate::KvStore`] (which this type implicitly derefences to) for full docs.
-        pub struct KvStore($crate::KvStore<TableStorage>);
+        #[allow(non_snake_case)]
+        pub struct KvStore {
+            store: Box<$crate::KvStore<TableStorage>>,
+
+            $($(#[allow(dead_code)] pub $name: $crate::Table<TableStorage, $name>,)*)?
+            $($(#[allow(dead_code)] pub $sname: $crate::Singleton<TableStorage, $sname>,)*)?
+        }
 
         impl KvStore {
             /// Create a new, empty KV store as described by the schema macros.
@@ -642,15 +702,123 @@ macro_rules! store {
             /// keeping the notifier alive (e.g. via the subscribers it hands out). Once the last
             /// strong reference is dropped the store stops sending notifications.
             pub fn from_notifier(notifier: std::sync::Weak<dyn $crate::Notifier<Notification = <TableStorage as $crate::schema::GeneratedStorage>::Notification>>) -> Self {
-                KvStore($crate::KvStore::new_with_storage(std::sync::RwLock::new($crate::storage::Storage::new(notifier))))
+                let store = Box::new($crate::KvStore::new_with_storage(std::sync::RwLock::new($crate::storage::Storage::new(notifier))));
+                let raw = store.as_ref() as *const $crate::KvStore<_>;
+                KvStore {
+                    $($($name: unsafe { $crate::Table::new(raw) },)*)?
+                    $($($sname: unsafe { $crate::Singleton::new(raw) },)*)?
+                    store,
+                }
             }
+
+            /// A convenience for operating on the store with a specified owner.
+            #[allow(dead_code)]
+            pub fn with_owner(&self, owner: $crate::Owner) -> KvStoreWithOwner<'_> {
+                let store = self.store.as_ref();
+                KvStoreWithOwner {
+                    $($($name: $crate::TableWithOwner::new(store, owner),)*)?
+                    $($($sname: $crate::SingletonWithOwner::new(store, owner),)*)?
+                    store,
+                    owner,
+                }
+            }
+        }
+
+        // Blocks moving the per-table/singleton fields out of the store: they hold pointers
+        // back into it, so they must not outlive it.
+        impl Drop for KvStore {
+            fn drop(&mut self) {}
         }
 
         impl std::ops::Deref for KvStore {
             type Target = $crate::KvStore<TableStorage>;
 
             fn deref(&self) -> &Self::Target {
-                &self.0
+                self.store.as_ref()
+            }
+        }
+
+        /// A key-value store with a fixed owner.
+        ///
+        /// Created by `KvStore::with_owner`. Operations on its fields do not take an owner, they
+        /// use the owner supplied to `with_owner`.
+        #[allow(non_snake_case)]
+        pub struct KvStoreWithOwner<'a> {
+            store: &'a $crate::KvStore<TableStorage>,
+            owner: $crate::Owner,
+
+            $($(#[allow(dead_code)] pub $name: $crate::TableWithOwner<'a, TableStorage, $name>,)*)?
+            $($(#[allow(dead_code)] pub $sname: $crate::SingletonWithOwner<'a, TableStorage, $sname>,)*)?
+        }
+
+        // Blocks moving the per-table/singleton fields out of the store: they hold pointers back
+        // into the store this borrows, and the borrow is what keeps them valid.
+        impl<'a> Drop for KvStoreWithOwner<'a> {
+            fn drop(&mut self) {}
+        }
+
+        #[allow(dead_code)]
+        impl<'a> KvStoreWithOwner<'a> {
+            /// Start a transaction.
+            ///
+            /// Blocks until the store's global lock is available for write access.
+            pub fn begin_transaction(&self) -> Transaction<'a> {
+                self.store.begin_transaction(self.owner)
+            }
+
+            /// Start a transaction.
+            ///
+            /// Returns `None` if the store's global lock is unavailable for write access.
+            pub fn try_begin_transaction(&self) -> Option<Transaction<'a>> {
+                self.store.try_begin_transaction(self.owner)
+            }
+
+            /// Start a read-only transaction (i.e., only supports non-mutating access to the store,
+            /// but all reads are guaranteed to be atomic).
+            ///
+            /// Blocks until the store's global lock is available for read access.
+            pub fn begin_ro_transaction(&self) -> RoTransaction<'a> {
+                self.store.begin_ro_transaction(self.owner)
+            }
+
+            /// Start a read-only transaction (i.e., only supports non-mutating access to the store,
+            /// but all reads are guaranteed to be atomic).
+            ///
+            /// Returns `None` if the store's global lock is unavailable for read access.
+            pub fn try_begin_ro_transaction(&self) -> Option<RoTransaction<'a>> {
+                self.store.try_begin_ro_transaction(self.owner)
+            }
+
+            /// Register a new subscriber (with the owner supplied to `with_owner`) to the store.
+            ///
+            /// Does not create any subscriptions.
+            pub fn register_subscriber(&self) -> $crate::Subscriber {
+                self.store.register_subscriber(self.owner)
+            }
+
+            /// Remove a subscriber from the store, along with all of its subscriptions.
+            ///
+            /// The subscriber receives no further notifications and cannot subscribe again
+            /// (subscribing with a removed subscriber gives [`$crate::Error::UnknownSubscriber`]).
+            /// Unsubscribing any of its subscriptions is harmless but pointless.
+            ///
+            /// Does nothing if the subscriber is unknown (e.g., because it has already been
+            /// removed).
+            pub fn remove_subscriber(&self, subscriber: $crate::Subscriber) {
+                self.store.remove_subscriber(subscriber)
+            }
+
+            /// Subscribe to the whole store.
+            pub fn subscribe_global(
+                &self,
+                subscriber: $crate::Subscriber,
+            ) -> $crate::Result<$crate::Subscription> {
+                self.store.subscribe_global(subscriber)
+            }
+
+            /// Remove any subscriptions to the whole store.
+            pub fn unsubscribe_global(&self, subscription: $crate::Subscription) {
+                self.store.unsubscribe_global(subscription);
             }
         }
 

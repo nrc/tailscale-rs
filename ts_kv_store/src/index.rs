@@ -39,31 +39,9 @@ impl<D: IndexDesc> IndexedOps<D::Storage> for &KvTableIndex<'_, D> {
 }
 
 impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
-    /// The number of key/value pairs in the base table.
-    pub fn len(&self) -> usize {
-        <&Self as IndexedOps<_>>::len(self)
-    }
-
-    /// True if the table is empty.
-    pub fn is_empty(&self) -> bool {
-        <&Self as IndexedOps<_>>::is_empty(self)
-    }
-
     /// Returns `Ok` if the index is consistent, and an error with some kind of explanation if not.
     pub fn check_consistent(&self) -> Result<()> {
         <&Self as IndexedOps<_>>::check_consistent(self)
-    }
-
-    /// Clear the base table by removing all its KVs.
-    pub fn clear(&self)
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        let mut txn = self.store.begin_transaction(self.owner);
-        let mut txn_table = KvTableTransactionalIndex::<D> { txn: &mut txn };
-        IndexedOpsMut::clear(&mut txn_table, self.owner);
-        // Should never panic since transaction should only fail on index inserts.
-        txn.commit().unwrap();
     }
 
     /// Get a row of the table from the store by cloning the value.
@@ -90,29 +68,6 @@ impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
         IndexValue<D>: Eq + Hash,
     {
         <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.owner)
-    }
-
-    /// Insert a value into the table using the base table's key.
-    ///
-    /// Panics if the value is already indexed with the same index key.
-    pub fn insert(&self, key: BaseKey<D>, value: BaseValue<D>)
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        self.try_insert(key, value).unwrap();
-    }
-
-    /// Insert a value into the table using the base table's key.
-    ///
-    /// Returns an error if `insert` would panic.
-    pub fn try_insert(&self, key: BaseKey<D>, value: BaseValue<D>) -> Result<()>
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        let mut txn = self.store.begin_transaction(self.owner);
-        let mut txn_table = KvTableTransactionalIndex::<D> { txn: &mut txn };
-        IndexedOpsMut::insert(&mut txn_table, key, value, self.owner);
-        txn.commit()
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -169,16 +124,6 @@ impl<'store, D: IndexDesc> KvTableIndex<'store, D> {
         IndexValue<D>: Eq + Hash,
     {
         <&Self as IndexedOps<_>>::keys(self, self.owner)
-    }
-
-    /// Iterate all the values in the base table.
-    pub fn values(&self) -> impl Iterator<Item = (&BaseKey<D>, &BaseValue<D>)>
-    where
-        D: 'store,
-        Base<D>: 'store,
-        IndexValue<D>: Eq + Hash,
-    {
-        <&Self as IndexedOps<_>>::values(self, self.owner)
     }
 
     /// Iterate all the key/value pairs in a table.
@@ -249,26 +194,8 @@ impl<'guard, 'txn, D: IndexDesc> IndexedOpsMut<D::Storage>
 }
 
 impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
-    /// The number of key/value pairs in the base table.
-    pub fn len(&self) -> usize {
-        <&Self as IndexedOps<_>>::len(self)
-    }
-
-    /// True if the table is empty.
-    pub fn is_empty(&self) -> bool {
-        <&Self as IndexedOps<_>>::is_empty(self)
-    }
-
     pub fn check_consistent(&self) -> Result<()> {
         <&Self as IndexedOps<_>>::check_consistent(self)
-    }
-
-    /// Clear the base table by removing all its KVs.
-    pub fn clear(&mut self)
-    where
-        IndexValue<D>: Eq + Hash,
-    {
-        <&mut Self as IndexedOpsMut<_>>::clear(self, self.txn.owner)
     }
 
     /// Get a row of the table from the store by cloning the value.
@@ -295,15 +222,6 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         IndexValue<D>: Eq + Hash,
     {
         <&Self as IndexedOps<_>>::with::<Q, T>(self, key, f, self.txn.owner)
-    }
-
-    /// Insert a value into the table using the base table's key.
-    pub fn insert(&mut self, key: BaseKey<D>, value: BaseValue<D>)
-    where
-        BaseKey<D>: Clone,
-        IndexValue<D>: Eq + Hash,
-    {
-        <&mut Self as IndexedOpsMut<_>>::insert(self, key, value, self.txn.owner)
     }
 
     /// Get mutable access to a row of the table in the store in the store.
@@ -353,16 +271,6 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
         <&Self as IndexedOps<_>>::keys(self, self.txn.owner)
     }
 
-    /// Iterate all the values in the base table.
-    pub fn values(&self) -> impl Iterator<Item = (&BaseKey<D>, &BaseValue<D>)>
-    where
-        D: 'guard,
-        Base<D>: 'guard,
-        IndexValue<D>: Eq + Hash,
-    {
-        <&Self as IndexedOps<_>>::values(self, self.txn.owner)
-    }
-
     /// Iterate all the key/value pairs in a table.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&D::Key, &BaseKey<D>, &mut BaseValue<D>)>
     where
@@ -371,15 +279,6 @@ impl<'guard, 'txn, D: IndexDesc> KvTableTransactionalIndex<'guard, 'txn, D> {
     {
         let owner = self.txn.owner;
         IndexedOpsMut::iter_mut(self, owner)
-    }
-
-    /// Iterate all the values in a table.
-    pub fn iter_base_mut(&mut self) -> impl Iterator<Item = (&BaseKey<D>, &mut BaseValue<D>)>
-    where
-        BaseValue<D>: Clone + PartialEq,
-    {
-        let owner = self.txn.owner;
-        IndexedOpsMut::values_mut(self, owner)
     }
 }
 
@@ -411,16 +310,6 @@ impl<'guard, 'txn, D: IndexDesc> IndexedOps<D::Storage>
 }
 
 impl<'guard, 'txn, D: IndexDesc> KvTableRoTransactionalIndex<'guard, 'txn, D> {
-    /// The number of key/value pairs in the base table.
-    pub fn len(&self) -> usize {
-        <&Self as IndexedOps<_>>::len(self)
-    }
-
-    /// True if the table is empty.
-    pub fn is_empty(&self) -> bool {
-        <&Self as IndexedOps<_>>::is_empty(self)
-    }
-
     pub fn check_consistent(&self) -> Result<()> {
         <&Self as IndexedOps<_>>::check_consistent(self)
     }
@@ -466,15 +355,6 @@ impl<'guard, 'txn, D: IndexDesc> KvTableRoTransactionalIndex<'guard, 'txn, D> {
         D: 'guard,
     {
         <&Self as IndexedOps<_>>::keys(self, self.txn.owner)
-    }
-
-    /// Iterate all the values in the base table.
-    pub fn values(&self) -> impl Iterator<Item = (&BaseKey<D>, &BaseValue<D>)>
-    where
-        D: 'guard,
-        IndexValue<D>: Eq + Hash,
-    {
-        <&Self as IndexedOps<_>>::values(self, self.txn.owner)
     }
 }
 

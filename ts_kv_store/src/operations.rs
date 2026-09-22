@@ -205,20 +205,6 @@ pub(crate) trait IndexedOps<TableStorage: schema::GeneratedStorage>:
 {
     type IndexDesc: IndexDesc<Storage = TableStorage>;
 
-    fn len(self) -> usize {
-        let storage = self.read_lock();
-        let storage = storage.storage();
-        let base = Base::<Self::IndexDesc>::get_table(&storage.tables);
-        base.len(storage.txn_id())
-    }
-
-    fn is_empty(self) -> bool {
-        let storage = self.read_lock();
-        let storage = storage.storage();
-        let base = Base::<Self::IndexDesc>::get_table(&storage.tables);
-        base.is_empty(storage.txn_id())
-    }
-
     fn check_consistent(self) -> Result<()> {
         let storage = self.read_lock();
         let storage = storage.storage();
@@ -320,26 +306,6 @@ pub(crate) trait IndexedOps<TableStorage: schema::GeneratedStorage>:
     {
         let guard = self.read_lock();
         IndexIterator::<'guard, <Self as Ops<_>>::ReadLock, Self::IndexDesc, iter::Keys>::new(guard)
-    }
-
-    fn values<'guard>(
-        self,
-        _owner: Owner,
-    ) -> impl Iterator<
-        Item = (
-            &'guard BaseKey<Self::IndexDesc>,
-            &'guard BaseValue<Self::IndexDesc>,
-        ),
-    >
-    where
-        Self::ReadLock: 'guard,
-        Self::IndexDesc: 'guard,
-        IndexValue<Self::IndexDesc>: Hash + Eq,
-    {
-        let guard = self.read_lock();
-        IndexIterator::<'guard, <Self as Ops<_>>::ReadLock, Self::IndexDesc, iter::Values>::new(
-            guard,
-        )
     }
 }
 
@@ -501,34 +467,6 @@ pub(crate) trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
 {
     type IndexDesc: IndexDesc<Storage = TableStorage>;
 
-    fn clear(self, owner: Owner)
-    where
-        IndexValue<Self::IndexDesc>: Hash + Eq,
-    {
-        let mut storage = self.write_lock();
-        let storage = storage.storage();
-        let txn_id = storage.txn_id();
-        let max_committed_id = storage.max_committed_id();
-
-        let base = Base::<Self::IndexDesc>::get_table_mut(&mut storage.tables);
-        base.assert_owner(owner);
-        base.clear(txn_id, max_committed_id);
-    }
-
-    fn insert(self, key: BaseKey<Self::IndexDesc>, value: BaseValue<Self::IndexDesc>, owner: Owner)
-    where
-        IndexValue<Self::IndexDesc>: Hash + Eq,
-    {
-        let mut storage = self.write_lock();
-        let storage = storage.storage();
-        let txn_id = storage.txn_id();
-        let max_committed_id = storage.max_committed_id();
-        let base = Base::<Self::IndexDesc>::get_table_mut(&mut storage.tables);
-        base.assert_owner(owner);
-
-        base.insert(key, value, txn_id, max_committed_id);
-    }
-
     fn with_mut<Q, T>(
         self,
         key: &Q,
@@ -604,28 +542,6 @@ pub(crate) trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
     {
         let guard = self.write_lock();
         IndexIteratorMut::<'guard, Self::WriteLock, Self::IndexDesc>::new(guard, owner)
-    }
-
-    fn values_mut<'guard>(
-        self,
-        owner: Owner,
-    ) -> impl Iterator<
-        Item = (
-            &'guard BaseKey<Self::IndexDesc>,
-            &'guard mut BaseValue<Self::IndexDesc>,
-        ),
-    >
-    where
-        Self::WriteLock: 'guard,
-        BaseValue<Self::IndexDesc>: Clone + PartialEq,
-    {
-        let guard = self.write_lock();
-        TableIteratorMut::<
-            'guard,
-            Self::WriteLock,
-            <Self::IndexDesc as IndexDesc>::BaseTable,
-            iter::KeysAndValues,
-        >::new(guard, owner)
     }
 }
 
